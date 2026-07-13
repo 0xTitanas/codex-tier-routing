@@ -424,14 +424,15 @@ def validate_executable_chain(
             if stat.S_ISLNK(status.st_mode):
                 continue
             mode = stat.S_IMODE(status.st_mode)
-            if mode & 0o002 and not mode & stat.S_ISVTX:
-                raise DispatchHalt(
-                    f"refusing world-writable {chain_label} component: {current}"
-                )
-            if status.st_uid != effective_uid and mode & 0o020:
-                raise DispatchHalt(
-                    f"refusing group-writable foreign {chain_label} component: {current}"
-                )
+            if status.st_uid != 0:
+                if mode & 0o002 and not mode & stat.S_ISVTX:
+                    raise DispatchHalt(
+                        f"refusing world-writable {chain_label} component: {current}"
+                    )
+                if status.st_uid != effective_uid and mode & 0o020:
+                    raise DispatchHalt(
+                        f"refusing group-writable foreign {chain_label} component: {current}"
+                    )
             reject_darwin_allow_acl(current, label=f"{chain_label} component")
 
     validate_chain(path, label)
