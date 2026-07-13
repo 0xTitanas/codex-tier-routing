@@ -169,7 +169,7 @@ class InstallerTests(unittest.TestCase):
             safe_bin.mkdir(mode=0o700)
             (safe_bin / "python3").symlink_to(unsafe_python)
             env = os.environ.copy()
-            env["PATH"] = f"{safe_bin}{os.pathsep}/usr/bin{os.pathsep}/bin"
+            env["PATH"] = f"{safe_bin}"
             result = self.install(
                 ROOT, "--strict", "--dry-run", env=env, test_build=False
             )
