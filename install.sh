@@ -233,15 +233,16 @@ validate_chain_components() {
       chain_without_other=${chain_mode%?}
       chain_group=${chain_without_other#${chain_without_other%?}}
       chain_other=${chain_mode#${chain_mode%?}}
-      case "$(printf '%04s' "$chain_mode" | tr ' ' '0')" in
-        [1357]* ) chain_sticky=1 ;; *) chain_sticky=0 ;;
-      esac
-      if [ "$chain_uid" != 0 ]; then
-        if [ "$chain_sticky" = 0 ]; then
-          case "$chain_other" in
-            [2367]) error "Refusing world-writable $chain_label component: $chain_current" ;;
-          esac
-        fi
+      chain_sticky=0
+      if [ -d "$chain_current" ]; then
+        case "$(printf '%04s' "$chain_mode" | tr ' ' '0')" in
+          [1357]* ) chain_sticky=1 ;;
+        esac
+      fi
+      if [ "$chain_sticky" = 0 ]; then
+        case "$chain_other" in
+          [2367]) error "Refusing world-writable $chain_label component: $chain_current" ;;
+        esac
         if [ "$chain_uid" != "$effective_uid" ]; then
           case "$chain_group" in
             [2367]) error "Refusing group-writable foreign $chain_label component: $chain_current" ;;
