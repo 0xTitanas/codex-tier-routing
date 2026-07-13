@@ -424,7 +424,7 @@ def validate_executable_chain(
             if stat.S_ISLNK(status.st_mode):
                 continue
             mode = stat.S_IMODE(status.st_mode)
-            if mode & 0o002:
+            if mode & 0o002 and not mode & stat.S_ISVTX:
                 raise DispatchHalt(
                     f"refusing world-writable {chain_label} component: {current}"
                 )
