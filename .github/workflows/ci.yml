@@ -60,7 +60,6 @@ jobs:
           SAFE_VENV="$RUNNER_TEMP/safe-python"
           python3 -m venv --copies "$SAFE_VENV"
           echo "$SAFE_VENV/bin" >> "$GITHUB_PATH"
-          echo "CODEX_TIER_PYTHON_BIN=$SAFE_VENV/bin/python3" >> "$GITHUB_ENV"
       - name: Validate repository
         run: python3 scripts/validate.py
       - name: Run unit tests
