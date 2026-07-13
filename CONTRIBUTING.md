@@ -1,0 +1,54 @@
+# Contributing
+
+Contributions are welcome when they keep the project small, testable, and
+fail-closed.
+
+## Before opening a pull request
+
+1. Open an issue for behavior changes that affect route policy, receipt fields,
+   installation boundaries, or supported platforms.
+2. Keep each pull request focused on one problem.
+3. Add regression coverage for behavior changes.
+4. Run the full local checks:
+
+```sh
+DEV_VENV="$(python3 -c 'import os,tempfile; print(os.path.realpath(tempfile.mkdtemp()))')/venv"
+python3 -m venv "$DEV_VENV"
+. "$DEV_VENV/bin/activate"
+python -m pip install --upgrade pip
+python -m pip install --disable-pip-version-check -r requirements-dev.txt
+python scripts/validate.py
+python -m unittest discover -s tests -v
+sh -n install.sh
+PYTHONPYCACHEPREFIX=/tmp/codex-tier-pycache python -m py_compile \
+  bin/codex-tier scripts/validate.py tests/test_codex_tier.py tests/test_installer.py
+ruff check .
+ruff format --check scripts tests bin/codex-tier
+```
+
+## Pull request expectations
+
+Describe:
+
+- the problem;
+- the smallest behavior change that solves it;
+- tests added or changed;
+- security or compatibility consequences;
+- anything intentionally left out of scope.
+
+Do not include credentials, private paths, session data, generated local state,
+or unrelated formatting changes.
+
+## Design rules
+
+- Fixed routes stay explicit and reviewable.
+- Unknown observations fail closed.
+- Requested configuration is not execution proof.
+- Write-capable failures are treated as potentially effectful.
+- User configuration changes must be reversible.
+- New dependencies need a clear reason and a maintenance plan.
+
+## Security reports
+
+Do not report vulnerabilities in a public pull request or issue. Follow
+[SECURITY.md](SECURITY.md).

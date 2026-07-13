@@ -1,0 +1,161 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/0xTitanas/codex-tier-routing/schemas/local-dispatch-receipt.schema.json",
+  "title": "Codex Tier Routing Local Dispatch Receipt",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema",
+    "receipt_id",
+    "mechanism",
+    "claim_class",
+    "route_requested",
+    "route_resolved",
+    "requested",
+    "codex_executable",
+    "codex_executable_sha256",
+    "observed",
+    "status",
+    "started_at",
+    "finished_at",
+    "output_sha256",
+    "rollout_sha256",
+    "error"
+  ],
+  "properties": {
+    "schema": {"const": "codex-tier-routing/local-dispatch-receipt/v1"},
+    "receipt_id": {"type": "string", "format": "uuid", "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$"},
+    "mechanism": {"const": "codex-exec-local"},
+    "claim_class": {"const": "dispatcher_configured_and_host_observed"},
+    "route_requested": {"enum": ["scout", "grunt", "builder", "reviewer", "architect"]},
+    "route_resolved": {"enum": ["scout", "grunt", "builder", "reviewer", "architect"]},
+    "requested": {"$ref": "#/$defs/routeObservation"},
+    "codex_executable": {"type": "string", "minLength": 1},
+    "codex_executable_sha256": {"$ref": "#/$defs/sha256"},
+    "observed": {
+      "oneOf": [
+        {"$ref": "#/$defs/hostObservation"},
+        {"type": "null"}
+      ]
+    },
+    "status": {"enum": ["pass", "halt"]},
+    "started_at": {"type": "string", "pattern": "^(?:(?:[0-9]{4}-(?:(?:01|03|05|07|08|10|12)-(?:0[1-9]|[12][0-9]|3[01])|(?:04|06|09|11)-(?:0[1-9]|[12][0-9]|30)|02-(?:0[1-9]|1[0-9]|2[0-8])))|(?:(?:[0-9]{2}(?:0[48]|[2468][048]|[13579][26])|(?:[02468][048]00|[13579][26]00))-02-29))[Tt](?:[01][0-9]|2[0-3]):[0-5][0-9]:[0-5][0-9](?:\\.[0-9]+)?(?:[Zz]|[+-](?:[01][0-9]|2[0-3]):[0-5][0-9])$"},
+    "finished_at": {"type": "string", "pattern": "^(?:(?:[0-9]{4}-(?:(?:01|03|05|07|08|10|12)-(?:0[1-9]|[12][0-9]|3[01])|(?:04|06|09|11)-(?:0[1-9]|[12][0-9]|30)|02-(?:0[1-9]|1[0-9]|2[0-8])))|(?:(?:[0-9]{2}(?:0[48]|[2468][048]|[13579][26])|(?:[02468][048]00|[13579][26]00))-02-29))[Tt](?:[01][0-9]|2[0-3]):[0-5][0-9]:[0-5][0-9](?:\\.[0-9]+)?(?:[Zz]|[+-](?:[01][0-9]|2[0-3]):[0-5][0-9])$"},
+    "output_sha256": {"oneOf": [{"$ref": "#/$defs/sha256"}, {"type": "null"}]},
+    "rollout_sha256": {"oneOf": [{"$ref": "#/$defs/sha256"}, {"type": "null"}]},
+    "error": {"type": ["string", "null"]}
+  },
+  "allOf": [
+    {
+      "if": {"properties": {"status": {"const": "pass"}}},
+      "then": {
+        "properties": {
+          "observed": {"$ref": "#/$defs/hostObservation"},
+          "output_sha256": {"$ref": "#/$defs/sha256"},
+          "rollout_sha256": {"$ref": "#/$defs/sha256"},
+          "error": {"type": "null"}
+        }
+      }
+    },
+    {
+      "if": {"properties": {"status": {"const": "halt"}}},
+      "then": {
+        "properties": {
+          "output_sha256": {"type": "null"},
+          "rollout_sha256": {"type": "null"},
+          "error": {"type": "string", "minLength": 1}
+        }
+      }
+    }
+  ],
+  "$defs": {
+    "sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+    "routeObservation": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["model", "effort", "sandbox", "approval_policy", "cwd"],
+      "properties": {
+        "model": {"type": "string", "minLength": 1},
+        "effort": {"type": "string", "minLength": 1},
+        "sandbox": {"enum": ["read-only", "workspace-write"]},
+        "approval_policy": {"const": "never"},
+        "cwd": {"type": "string", "minLength": 1}
+      }
+    },
+    "hostObservation": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "session_id", "source", "originator", "model_provider", "model",
+        "effort", "sandbox", "sandbox_policy", "approval_policy", "cwd", "session_cwd", "cli_version"
+      ],
+      "properties": {
+        "session_id": {"type": "string", "minLength": 1},
+        "source": {"const": "exec"},
+        "originator": {"type": ["string", "null"]},
+        "model_provider": {"type": ["string", "null"]},
+        "model": {"type": "string", "minLength": 1},
+        "effort": {"type": "string", "minLength": 1},
+        "sandbox": {"enum": ["read-only", "workspace-write"]},
+        "sandbox_policy": {
+          "oneOf": [
+            {
+              "type": "object",
+              "additionalProperties": false,
+              "required": ["type"],
+              "properties": {"type": {"const": "read-only"}}
+            },
+            {
+              "type": "object",
+              "additionalProperties": false,
+              "required": ["type", "network_access", "exclude_slash_tmp", "exclude_tmpdir_env_var"],
+              "properties": {
+                "type": {"const": "workspace-write"},
+                "network_access": {"const": false},
+                "exclude_slash_tmp": {"type": "boolean"},
+                "exclude_tmpdir_env_var": {"type": "boolean"}
+              }
+            }
+          ]
+        },
+        "approval_policy": {"const": "never"},
+        "cwd": {"type": "string", "minLength": 1},
+        "session_cwd": {"type": "string", "minLength": 1},
+        "cli_version": {"type": ["string", "null"]}
+      },
+      "allOf": [
+        {
+          "if": {"properties": {"sandbox": {"const": "read-only"}}},
+          "then": {
+            "properties": {
+              "sandbox_policy": {
+                "type": "object",
+                "additionalProperties": false,
+                "required": ["type"],
+                "properties": {"type": {"const": "read-only"}}
+              }
+            }
+          }
+        },
+        {
+          "if": {"properties": {"sandbox": {"const": "workspace-write"}}},
+          "then": {
+            "properties": {
+              "sandbox_policy": {
+                "type": "object",
+                "additionalProperties": false,
+                "required": ["type", "network_access", "exclude_slash_tmp", "exclude_tmpdir_env_var"],
+                "properties": {
+                  "type": {"const": "workspace-write"},
+                  "network_access": {"const": false},
+                  "exclude_slash_tmp": {"type": "boolean"},
+                  "exclude_tmpdir_env_var": {"type": "boolean"}
+                }
+              }
+            }
+          }
+        }
+      ]
+    }
+  }
+}
