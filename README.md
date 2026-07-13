@@ -6,7 +6,7 @@
 
 [![License: MIT](https://img.shields.io/badge/license-MIT-2ea44f.svg)](LICENSE)
 [![Release: v1.0.0-rc.1](https://img.shields.io/badge/release-v1.0.0--rc.1-f0ad4e.svg)](CHANGELOG.md)
-[![Platforms: macOS + Linux](https://img.shields.io/badge/platforms-macOS%20%2B%20Linux-4c78ff.svg)](docs/compatibility.md)
+[![Platforms: macOS + Linux](https://img.shields.io/badge/platforms-macOS%20%2B%20Linux%20%7C%20Win%20dev-4c78ff.svg)](docs/compatibility.md)
 
 </div>
 
@@ -75,7 +75,7 @@ effective feature state before a routed child starts.
 - An installed Codex CLI with `codex exec`
 - A working Codex login for that CLI
 - Access to the configured model names
-- macOS or Linux
+- macOS, Linux, or Windows (in development)
 
 See [compatibility](docs/compatibility.md) for the tested boundary.
 
@@ -241,7 +241,7 @@ Read [SECURITY.md](SECURITY.md) and the
 
 ## Limits
 
-- Windows is not supported.
+- Windows support is in development; macOS and Linux are tested today.
 - Compatibility is bounded to the versions and platforms listed in
   [docs/compatibility.md](docs/compatibility.md).
 - The ledger provides local self-consistency checks. An actor able to rewrite
