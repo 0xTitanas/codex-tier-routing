@@ -10,7 +10,7 @@
 
 </div>
 
-![Codex Tier Routing: route by task, verify before trust](docs/assets/codex-tier-routing-header.svg)
+![Codex Tier Routing: route by task, verify before trust](docs/assets/codex-tier-routing-header.jpg)
 
 <p align="center">
 Original project by <a href="https://github.com/0xTitanas">0xTitanas</a> ·
