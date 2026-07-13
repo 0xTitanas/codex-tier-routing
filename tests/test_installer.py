@@ -106,10 +106,10 @@ class InstallerTests(unittest.TestCase):
         fake_python.chmod(0o755)
         fake_bin.chmod(0o777)
         env = os.environ.copy()
-        env["PATH"] = f"{fake_bin}{os.pathsep}{env['PATH']}"
+        env["CODEX_TIER_PYTHON_BIN"] = str(fake_python)
         result = self.install(ROOT, "--strict", "--dry-run", env=env, test_build=False)
         self.assertNotEqual(result.returncode, 0)
-        self.assertIn("runtime PATH", result.stderr)
+        self.assertIn("Python 3 executable path", result.stderr)
         self.assertFalse(marker.exists())
 
     def test_shipped_installer_cannot_activate_test_utility_seam(self) -> None:
@@ -318,6 +318,7 @@ class InstallerTests(unittest.TestCase):
         self.assertFalse(marker.exists())
         self.assertFalse(config.exists())
         self.assertFalse((self.home / "bin" / "codex-tier").exists())
+        self.assertFalse((self.home / "bin" / "codex-tier.py").exists())
 
     def test_installs_complete_bundle_and_probe_runs(self) -> None:
         result = self.install()
@@ -325,9 +326,13 @@ class InstallerTests(unittest.TestCase):
         self.assertTrue((self.home / "skills" / "model-routing" / "SKILL.md").is_file())
         self.assertEqual(len(list((self.home / "agents").glob("*.toml"))), 5)
         dispatcher = self.home / "bin" / "codex-tier"
+        runtime = self.home / "bin" / "codex-tier.py"
         self.assertTrue(dispatcher.is_file())
         self.assertTrue(os.access(dispatcher, os.X_OK))
+        self.assertTrue(runtime.is_file())
+        self.assertEqual(runtime.stat().st_mode & 0o777, 0o600)
         self.assertIn(str(dispatcher), result.stdout)
+        self.assertIn(str(runtime), result.stdout)
         fake_codex = self.base / "fake codex"
         fake_codex.write_text(
             "#!/bin/sh\n"
@@ -352,6 +357,33 @@ class InstallerTests(unittest.TestCase):
         )
         self.assertEqual(probe.returncode, 0, probe.stderr)
         self.assertIn('"status": "ready"', probe.stdout)
+
+    def test_install_upgrade_and_uninstall_preserve_custom_policy(self) -> None:
+        state = self.home / "tier-routing"
+        state.mkdir(parents=True, mode=0o700)
+        state.chmod(0o700)
+        policy = state / "policy.toml"
+        original = (ROOT / "policy.sample.toml").read_bytes()
+        policy.write_bytes(original)
+        policy.chmod(0o600)
+
+        first = self.install()
+        self.assertEqual(first.returncode, 0, first.stdout + first.stderr)
+        self.assertEqual(policy.read_bytes(), original)
+        second = self.install()
+        self.assertEqual(second.returncode, 0, second.stdout + second.stderr)
+        self.assertEqual(policy.read_bytes(), original)
+
+        uninstall = second.stdout.strip().splitlines()[-1]
+        removed = subprocess.run(
+            ["/bin/sh", "-c", uninstall],
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            check=False,
+        )
+        self.assertEqual(removed.returncode, 0, removed.stdout + removed.stderr)
+        self.assertEqual(policy.read_bytes(), original)
 
     def test_new_internal_directories_are_private_under_permissive_umask(self) -> None:
         env = os.environ.copy()
@@ -387,6 +419,10 @@ class InstallerTests(unittest.TestCase):
             self.assertEqual(skill_file.stat().st_mode & 0o777, expected)
         self.assertEqual(
             (self.home / "bin" / "codex-tier").stat().st_mode & 0o777, 0o700
+        )
+        self.assertEqual(
+            (self.home / "bin" / "codex-tier.py").stat().st_mode & 0o777,
+            0o600,
         )
 
     def test_skill_source_symlink_or_special_node_halts_before_staging(self) -> None:
@@ -806,7 +842,7 @@ class InstallerTests(unittest.TestCase):
         (fake_bin / "id").write_text("#!/bin/sh\nprintf '4242\\n'\n")
         (fake_bin / "stat").write_text(
             "#!/bin/sh\ncase \"$2\" in %u) printf '4242\\n' ;; "
-            "%a) case \"$3\" in */agents/*.toml) printf '600\\n' ;; *) printf '700\\n' ;; esac ;; "
+            "%a) case \"$3\" in */agents/*.toml|*/bin/codex-tier.py) printf '600\\n' ;; *) printf '700\\n' ;; esac ;; "
             "%d) case \"$3\" in *backups) printf '2\\n' ;; *) printf '1\\n' ;; esac ;; esac\n"
         )
         for tool in fake_bin.iterdir():
@@ -840,7 +876,7 @@ class InstallerTests(unittest.TestCase):
                 (fake_bin / "id").write_text("#!/bin/sh\nprintf '4242\\n'\n")
                 (fake_bin / "stat").write_text(
                     f'#!/bin/sh\nprintf \'%s %s\\n\' "$1" "$2" >> {log!s}\n'
-                    "case \"$2\" in %a|%Mp%Lp) case \"$3\" in */agents/*.toml) printf '600\\n' ;; *) printf '700\\n' ;; esac ;; "
+                    "case \"$2\" in %a|%Mp%Lp) case \"$3\" in */agents/*.toml|*/bin/codex-tier.py) printf '600\\n' ;; *) printf '700\\n' ;; esac ;; "
                     "*) printf '4242\\n' ;; esac\n"
                 )
                 if platform == "Darwin":

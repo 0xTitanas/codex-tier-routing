@@ -20,10 +20,11 @@ python -m pip install --disable-pip-version-check -r requirements-dev.txt
 python scripts/validate.py
 python -m unittest discover -s tests -v
 sh -n install.sh
+sh -n bin/codex-tier
 PYTHONPYCACHEPREFIX=/tmp/codex-tier-pycache python -m py_compile \
-  bin/codex-tier scripts/validate.py tests/test_codex_tier.py tests/test_installer.py
+  bin/codex-tier.py scripts/validate.py tests/test_codex_tier.py tests/test_installer.py
 ruff check .
-ruff format --check scripts tests bin/codex-tier
+ruff format --check scripts tests bin/codex-tier.py
 ```
 
 ## Pull request expectations
@@ -39,14 +40,20 @@ Describe:
 Do not include credentials, private paths, session data, generated local state,
 or unrelated formatting changes.
 
+Maintainer release steps, including clean GitHub CI and tag verification, are
+documented in [docs/releasing.md](docs/releasing.md).
+
 ## Design rules
 
-- Fixed routes stay explicit and reviewable.
+- Stable route roles and authority boundaries stay explicit and reviewable;
+  custom policies may select only model and effort.
 - Unknown observations fail closed.
 - Requested configuration is not execution proof.
+- Generic or host-injected spawning is not a tier-routing receipt.
 - Write-capable failures are treated as potentially effectful.
 - User configuration changes must be reversible.
 - New dependencies need a clear reason and a maintenance plan.
+- Security claims must remain within [the threat model](docs/threat-model.md).
 
 ## Security reports
 

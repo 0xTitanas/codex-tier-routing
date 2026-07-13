@@ -13,6 +13,7 @@ import importlib.util
 import json
 import os
 import re
+import shutil
 import stat
 import subprocess
 import sys
@@ -26,7 +27,8 @@ from unittest import mock
 
 
 ROOT = Path(__file__).resolve().parents[1]
-DISPATCHER = ROOT / "bin" / "codex-tier"
+LAUNCHER = ROOT / "bin" / "codex-tier"
+DISPATCHER = ROOT / "bin" / "codex-tier.py"
 DISPATCHER_SPEC = importlib.util.spec_from_loader(
     "codex_tier", importlib.machinery.SourceFileLoader("codex_tier", str(DISPATCHER))
 )
@@ -88,6 +90,7 @@ def validate_local_schema(
     if expected_type is not None:
         valid_types = {
             "object": lambda value: isinstance(value, dict),
+            "array": lambda value: isinstance(value, list),
             "string": lambda value: isinstance(value, str),
             "boolean": lambda value: isinstance(value, bool),
             "null": lambda value: value is None,
@@ -109,6 +112,10 @@ def validate_local_schema(
         if schema.get("format") == "date-time":
             if not is_rfc3339_datetime(instance):
                 errors.append("format date-time")
+    if isinstance(instance, list) and len(instance) > schema.get(
+        "maxItems", sys.maxsize
+    ):
+        errors.append("maxItems")
     if isinstance(instance, dict):
         required = schema.get("required", [])
         errors.extend(f"required {key}" for key in required if key not in instance)
@@ -130,8 +137,11 @@ def validate_local_schema(
     ):
         errors.append("oneOf")
     for condition in schema.get("allOf", []):
-        if not validate_local_schema(instance, condition["if"], root):
-            errors.extend(validate_local_schema(instance, condition["then"], root))
+        if "if" in condition:
+            if not validate_local_schema(instance, condition["if"], root):
+                errors.extend(validate_local_schema(instance, condition["then"], root))
+        else:
+            errors.extend(validate_local_schema(instance, condition, root))
     return errors
 
 
@@ -149,6 +159,7 @@ def ordinary_draft202012_valid(
         types = expected_type if isinstance(expected_type, list) else [expected_type]
         type_checks = {
             "object": lambda value: isinstance(value, dict),
+            "array": lambda value: isinstance(value, list),
             "string": lambda value: isinstance(value, str),
             "boolean": lambda value: isinstance(value, bool),
             "null": lambda value: value is None,
@@ -164,6 +175,10 @@ def ordinary_draft202012_valid(
             return False
         if "pattern" in schema and re.fullmatch(schema["pattern"], instance) is None:
             return False
+    if isinstance(instance, list) and len(instance) > schema.get(
+        "maxItems", sys.maxsize
+    ):
+        return False
     if isinstance(instance, dict):
         properties = schema.get("properties", {})
         if any(key not in instance for key in schema.get("required", [])):
@@ -187,11 +202,15 @@ def ordinary_draft202012_valid(
         != 1
     ):
         return False
-    return all(
-        not ordinary_draft202012_valid(instance, condition["if"], root)
-        or ordinary_draft202012_valid(instance, condition["then"], root)
-        for condition in schema.get("allOf", [])
-    )
+    for condition in schema.get("allOf", []):
+        if "if" in condition:
+            if ordinary_draft202012_valid(
+                instance, condition["if"], root
+            ) and not ordinary_draft202012_valid(instance, condition["then"], root):
+                return False
+        elif not ordinary_draft202012_valid(instance, condition, root):
+            return False
+    return True
 
 
 def schema_keywords(schema: dict) -> tuple[set[str], set[str]]:
@@ -210,6 +229,7 @@ def schema_keywords(schema: dict) -> tuple[set[str], set[str]]:
         "then",
         "pattern",
         "minLength",
+        "maxItems",
     }
     used: set[str] = set()
 
@@ -232,6 +252,31 @@ def schema_keywords(schema: dict) -> tuple[set[str], set[str]]:
     for definition in schema["$defs"].values():
         visit(definition)
     return used, metadata
+
+
+def expand_envelope_schema(envelope: dict, receipt: dict) -> dict:
+    """Inline the published local receipt reference for dependency-free tests."""
+
+    def expand(node: object, root: dict) -> object:
+        if isinstance(node, list):
+            return [expand(value, root) for value in node]
+        if not isinstance(node, dict):
+            return node
+        reference = node.get("$ref")
+        if reference == "local-dispatch-receipt.schema.json":
+            return expand(
+                {
+                    key: value
+                    for key, value in receipt.items()
+                    if key not in {"$schema", "$id", "title", "$defs"}
+                },
+                receipt,
+            )
+        if isinstance(reference, str) and reference.startswith("#/$defs/"):
+            return expand(root["$defs"][reference.rsplit("/", 1)[1]], root)
+        return {key: expand(value, root) for key, value in node.items()}
+
+    return expand(envelope, envelope)  # type: ignore[return-value]
 
 
 FAKE_CODEX = r"""#!/usr/bin/env python3
@@ -291,6 +336,9 @@ cwd = str(Path(after("-C")).resolve())
 prompt = sys.stdin.read()
 home = Path(os.environ["CODEX_HOME"])
 (home / "argv.json").write_text(json.dumps({"argv": args, "prompt": prompt, "process_cwd": os.getcwd()}))
+if mode == "mutate_policy":
+    policy = home / "tier-routing" / "policy.toml"
+    policy.write_text(policy.read_text() + "\n# changed during dispatch\n")
 
 if mode == "nonzero":
     print("synthetic error", file=sys.stderr)
@@ -329,13 +377,26 @@ if mode != "no_rollout":
             "exclude_tmpdir_env_var": False,
         })
         if mode != "missing_network":
-            sandbox_policy["network_access"] = mode == "network_enabled"
+            sandbox_policy["network_access"] = (
+                mode == "network_enabled"
+                or (
+                    mode == "configured_authority_expansion"
+                    and "sandbox_workspace_write.network_access=false" not in args
+                )
+            )
+        if (
+            mode == "configured_authority_expansion"
+            and "sandbox_workspace_write.writable_roots=[]" not in args
+        ):
+            sandbox_policy["writable_roots"] = ["/configured-extra-root"]
         if mode == "missing_exclude_slash_tmp":
             sandbox_policy.pop("exclude_slash_tmp")
         if mode == "nonboolean_exclude_tmpdir":
             sandbox_policy["exclude_tmpdir_env_var"] = "false"
     if mode == "extra_writable_root":
         sandbox_policy["writable_roots"] = ["/unexpected"]
+    if mode == "explicit_empty_writable_roots":
+        sandbox_policy["writable_roots"] = []
     turn = {
         "type": "turn_context",
         "payload": {
@@ -399,6 +460,14 @@ class DispatcherTests(unittest.TestCase):
         (self.home / "config.toml").write_text("[features]\nmulti_agent = false\n")
         self.workdir = self.base / "work"
         self.workdir.mkdir()
+        installed_bin = self.base / "installed-bin"
+        installed_bin.mkdir(mode=0o700)
+        self.launcher = installed_bin / "codex-tier"
+        self.runtime = installed_bin / "codex-tier.py"
+        shutil.copyfile(LAUNCHER, self.launcher)
+        shutil.copyfile(DISPATCHER, self.runtime)
+        self.launcher.chmod(0o700)
+        self.runtime.chmod(0o600)
         self.fake = self.base / "codex"
         self.fake.write_text(textwrap.dedent(FAKE_CODEX), encoding="utf-8")
         self.fake.chmod(0o755)
@@ -415,7 +484,8 @@ class DispatcherTests(unittest.TestCase):
         child_override_ignored: bool = False,
     ) -> None:
         mode_dir = self.home / "tier-routing"
-        mode_dir.mkdir(parents=True, exist_ok=True)
+        mode_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
+        mode_dir.chmod(0o700)
         (mode_dir / "fake-codex-mode.json").write_text(
             json.dumps(
                 {
@@ -448,8 +518,7 @@ class DispatcherTests(unittest.TestCase):
         )
         self._write_fake_mode(mode=mode)
         command = [
-            sys.executable,
-            str(DISPATCHER),
+            str(self.launcher),
             "dispatch",
             "--route",
             route,
@@ -474,13 +543,42 @@ class DispatcherTests(unittest.TestCase):
     def envelope(self, result: subprocess.CompletedProcess[str]) -> dict:
         return json.loads(result.stdout)
 
+    def write_policy(
+        self,
+        *,
+        overrides: dict[str, tuple[str, str]] | None = None,
+    ) -> Path:
+        selections = {
+            name: (route.model, route.effort)
+            for name, route in CODEX_TIER.ROUTES.items()
+        }
+        selections.update(overrides or {})
+        lines = [f'schema = "{CODEX_TIER.POLICY_SCHEMA}"']
+        for name in CODEX_TIER.ROUTES:
+            model, effort = selections[name]
+            lines.extend(
+                [
+                    "",
+                    f"[routes.{name}]",
+                    f'model = "{model}"',
+                    f'effort = "{effort}"',
+                ]
+            )
+        state = self.home / "tier-routing"
+        state.mkdir(mode=0o700, exist_ok=True)
+        state.chmod(0o700)
+        policy = state / "policy.toml"
+        policy.write_text("\n".join(lines) + "\n", encoding="utf-8")
+        policy.chmod(0o600)
+        return policy
+
     def test_probe_has_no_model_call(self) -> None:
         env = os.environ.copy()
         env.update(
             {"CODEX_HOME": str(self.home), "CODEX_TIER_CODEX_BIN": str(self.fake)}
         )
         result = subprocess.run(
-            [sys.executable, str(DISPATCHER), "probe"],
+            [str(self.launcher), "probe"],
             text=True,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
@@ -490,11 +588,310 @@ class DispatcherTests(unittest.TestCase):
         payload = json.loads(result.stdout)
         self.assertEqual(result.returncode, 0)
         self.assertEqual(payload["status"], "ready")
+        self.assertEqual(payload["dispatcher_version"], CODEX_TIER.PROJECT_VERSION)
         self.assertEqual(
             set(payload["routes"]),
             {"scout", "grunt", "builder", "reviewer", "architect"},
         )
+        self.assertEqual(payload["policy"]["kind"], "builtin")
+        self.assertEqual(payload["policy"]["model_access"], "not_checked")
         self.assertFalse((self.home / "argv.json").exists())
+
+    def test_version_is_machine_readable_and_offline(self) -> None:
+        env = os.environ.copy()
+        env.update(
+            {"CODEX_HOME": str(self.home), "CODEX_TIER_CODEX_BIN": str(self.fake)}
+        )
+        result = subprocess.run(
+            [str(self.launcher), "--version"],
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            env=env,
+            check=False,
+        )
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertEqual(result.stdout, f"codex-tier {CODEX_TIER.PROJECT_VERSION}\n")
+        self.assertFalse((self.home / "argv.json").exists())
+
+    def test_policy_check_is_offline_and_reports_supported_parameters(self) -> None:
+        env = {
+            **os.environ,
+            "CODEX_HOME": str(self.home),
+            # A policy check must not need or execute this path.
+            "CODEX_TIER_CODEX_BIN": str(self.base / "missing-codex"),
+        }
+        result = subprocess.run(
+            [str(self.launcher), "policy-check"],
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            env=env,
+            check=False,
+        )
+        payload = json.loads(result.stdout)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertEqual(payload["status"], "pass")
+        self.assertEqual(payload["dispatcher_version"], CODEX_TIER.PROJECT_VERSION)
+        self.assertEqual(payload["policy_kind"], "builtin")
+        self.assertEqual(payload["model_access"], "not_checked")
+        self.assertEqual(payload["model_catalog"], CODEX_TIER.MODEL_CATALOG_URL)
+        self.assertEqual(payload["accepted_efforts"], list(CODEX_TIER.ACCEPTED_EFFORTS))
+        self.assertIn("canary", payload["model_access_note"])
+        self.assertFalse((self.home / "argv.json").exists())
+
+    def test_custom_policy_changes_only_model_and_effort(self) -> None:
+        policy_path = self.write_policy(overrides={"builder": ("gpt-5.6", "max")})
+        expected_hash = hashlib.sha256(policy_path.read_bytes()).hexdigest()
+        result = self.run_dispatch(route="builder")
+        envelope = self.envelope(result)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        receipt = envelope["receipt"]
+        self.assertEqual(receipt["policy_kind"], "custom")
+        self.assertEqual(receipt["policy_id"], CODEX_TIER.CUSTOM_POLICY_ID)
+        self.assertEqual(receipt["policy_input_sha256"], expected_hash)
+        self.assertEqual(
+            receipt["policy_sha256"],
+            hashlib.sha256(
+                json.dumps(
+                    receipt["policy_document"],
+                    sort_keys=True,
+                    separators=(",", ":"),
+                ).encode()
+            ).hexdigest(),
+        )
+        self.assertEqual(receipt["observed"]["model"], "gpt-5.6")
+        self.assertEqual(receipt["observed"]["effort"], "max")
+        self.assertEqual(receipt["observed"]["sandbox"], "workspace-write")
+        recorded = json.loads((self.home / "argv.json").read_text())
+        self.assertIn("features.multi_agent=false", recorded["argv"])
+        self.assertIn('approval_policy="never"', recorded["argv"])
+        self.assertIn("sandbox_workspace_write.network_access=false", recorded["argv"])
+        self.assertIn("sandbox_workspace_write.writable_roots=[]", recorded["argv"])
+        self.assertIn("--strict-config", recorded["argv"])
+
+    def test_custom_policy_validation_is_exact_and_actionable(self) -> None:
+        policy = self.write_policy()
+        env = {**os.environ, "CODEX_HOME": str(self.home)}
+        invalid_cases = (
+            (
+                "unknown effort",
+                policy.read_text().replace('effort = "low"', 'effort = "turbo"', 1),
+                "effort must be one of",
+            ),
+            (
+                "unsafe model",
+                policy.read_text().replace(
+                    'model = "gpt-5.6-luna"', 'model = "provider/model"', 1
+                ),
+                "model must match",
+            ),
+            (
+                "mutable boundary",
+                policy.read_text().replace(
+                    'effort = "low"',
+                    'effort = "low"\nsandbox = "danger-full-access"',
+                    1,
+                ),
+                "exactly model and effort",
+            ),
+            (
+                "missing route",
+                policy.read_text().split("\n[routes.architect]", 1)[0] + "\n",
+                "routes must be exactly",
+            ),
+            (
+                "policy id is not owner-configurable",
+                policy.read_text().replace(
+                    "\n[routes.scout]",
+                    '\npolicy_id = "owner-choice"\n\n[routes.scout]',
+                    1,
+                ),
+                "top-level keys must be exactly schema and routes",
+            ),
+            (
+                "extra top-level key",
+                policy.read_text() + "unexpected = true\n",
+                "must contain exactly model and effort",
+            ),
+        )
+        for label, contents, marker in invalid_cases:
+            with self.subTest(case=label):
+                policy.write_text(contents, encoding="utf-8")
+                policy.chmod(0o600)
+                result = subprocess.run(
+                    [str(self.launcher), "policy-check"],
+                    text=True,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    env=env,
+                    check=False,
+                )
+                self.assertEqual(result.returncode, 2)
+                self.assertIn(marker, json.loads(result.stdout)["error"])
+                policy = self.write_policy()
+
+    def test_policy_file_security_and_bounds_fail_closed(self) -> None:
+        policy = self.write_policy()
+        env = {**os.environ, "CODEX_HOME": str(self.home)}
+
+        policy.chmod(0o644)
+        result = subprocess.run(
+            [str(self.launcher), "policy-check"],
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            env=env,
+            check=False,
+        )
+        self.assertEqual(result.returncode, 2)
+        self.assertIn("mode 0600", result.stdout)
+
+        policy.unlink()
+        target = self.base / "external-policy.toml"
+        target.write_text((ROOT / "policy.sample.toml").read_text())
+        policy.symlink_to(target)
+        result = subprocess.run(
+            [str(self.launcher), "policy-check"],
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            env=env,
+            check=False,
+        )
+        self.assertEqual(result.returncode, 2)
+        self.assertIn("symlinked routing policy", result.stdout)
+
+        policy.unlink()
+        policy.write_bytes(b"x" * (CODEX_TIER.MAX_POLICY_BYTES + 1))
+        policy.chmod(0o600)
+        result = subprocess.run(
+            [str(self.launcher), "policy-check"],
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            env=env,
+            check=False,
+        )
+        self.assertEqual(result.returncode, 2)
+        self.assertIn("byte limit", result.stdout)
+
+        policy.write_bytes(b"\xff")
+        policy.chmod(0o600)
+        result = subprocess.run(
+            [str(self.launcher), "policy-check"],
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            env=env,
+            check=False,
+        )
+        self.assertEqual(result.returncode, 2)
+        self.assertIn("UTF-8 TOML", result.stdout)
+
+        policy.unlink()
+        (self.home / "tier-routing").chmod(0o755)
+        result = subprocess.run(
+            [str(self.launcher), "policy-check"],
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            env=env,
+            check=False,
+        )
+        self.assertEqual(result.returncode, 2)
+        self.assertIn("mode 0700", result.stdout)
+
+    def test_every_supported_effort_parses_and_unknown_model_never_falls_back(
+        self,
+    ) -> None:
+        for effort in CODEX_TIER.ACCEPTED_EFFORTS:
+            with self.subTest(effort=effort):
+                policy = self.write_policy(overrides={"scout": ("gpt-5.6", effort)})
+                parsed = CODEX_TIER.load_policy(self.home)
+                self.assertEqual(parsed.routes["scout"].effort, effort)
+                policy.unlink()
+
+        self.write_policy(overrides={"scout": ("gpt-synthetic-unavailable", "low")})
+        result = self.run_dispatch(mode="nonzero")
+        receipt = self.envelope(result)["receipt"]
+        self.assertEqual(result.returncode, 2)
+        self.assertEqual(receipt["requested"]["model"], "gpt-synthetic-unavailable")
+        self.assertIn("exited nonzero", receipt["error"])
+        ledger = self.home / "tier-routing" / "ledger.jsonl"
+        self.assertEqual(len(ledger.read_text().splitlines()), 1)
+        argv = json.loads((self.home / "argv.json").read_text())["argv"]
+        self.assertEqual(argv.count("gpt-synthetic-unavailable"), 1)
+
+    def test_policy_rejects_foreign_owner_and_macos_allow_acl(self) -> None:
+        policy = self.write_policy()
+        foreign = mock.Mock(
+            st_mode=stat.S_IFREG | 0o600,
+            st_uid=os.geteuid() + 1,
+            st_size=policy.stat().st_size,
+        )
+        with mock.patch.object(CODEX_TIER.os, "fstat", return_value=foreign):
+            with self.assertRaisesRegex(CODEX_TIER.DispatchHalt, "current-owner"):
+                CODEX_TIER.load_policy(self.home)
+
+        allow = subprocess.CompletedProcess(
+            args=["/bin/ls"],
+            returncode=0,
+            stdout="drwx------@ 1 user staff 32 Jul 12 00:00 path\n"
+            " 0: user:other allow read\n",
+            stderr="",
+        )
+        with (
+            mock.patch.object(CODEX_TIER.sys, "platform", "darwin"),
+            mock.patch.object(CODEX_TIER.subprocess, "run", return_value=allow),
+        ):
+            with self.assertRaisesRegex(CODEX_TIER.DispatchHalt, "ACL allow"):
+                CODEX_TIER.load_policy(self.home)
+
+    def test_policy_change_during_dispatch_halts_with_initial_receipt(self) -> None:
+        policy = self.write_policy()
+        initial_hash = hashlib.sha256(policy.read_bytes()).hexdigest()
+        result = self.run_dispatch(mode="mutate_policy")
+        receipt = self.envelope(result)["receipt"]
+        self.assertEqual(result.returncode, 2)
+        self.assertEqual(receipt["status"], "halt")
+        self.assertEqual(receipt["policy_input_sha256"], initial_hash)
+        self.assertIn("policy changed during dispatch", receipt["error"])
+        self.assertIsNone(self.envelope(result)["result"])
+
+    def test_policy_binding_semantics_reject_tampering(self) -> None:
+        receipt = self.envelope(self.run_dispatch())["receipt"]
+        CODEX_TIER.verify_policy_binding(receipt)
+        mutations = (
+            (
+                "document hash",
+                lambda value: value["policy_document"]["routes"]["scout"].update(
+                    model="gpt-5.6"
+                ),
+            ),
+            (
+                "identifier",
+                lambda value: value.update(policy_id="other-policy"),
+            ),
+            (
+                "route resolution",
+                lambda value: value.update(route_resolved="reviewer"),
+            ),
+            (
+                "request",
+                lambda value: value["requested"].update(effort="max"),
+            ),
+            (
+                "observation",
+                lambda value: value["observed"].update(effort="max"),
+            ),
+        )
+        for label, mutate in mutations:
+            with self.subTest(tamper=label):
+                value = json.loads(json.dumps(receipt))
+                mutate(value)
+                with self.assertRaises(CODEX_TIER.DispatchHalt):
+                    CODEX_TIER.verify_policy_binding(value)
 
     def test_codex_executable_requires_a_safe_absolute_path(self) -> None:
         unsafe_dir = self.base / "unsafe-bin"
@@ -507,7 +904,7 @@ class DispatcherTests(unittest.TestCase):
         env = os.environ.copy()
         env.update({"CODEX_HOME": str(self.home), "CODEX_TIER_CODEX_BIN": str(unsafe)})
         result = subprocess.run(
-            [sys.executable, str(DISPATCHER), "probe"],
+            [str(self.launcher), "probe"],
             text=True,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
@@ -519,7 +916,7 @@ class DispatcherTests(unittest.TestCase):
 
         env["CODEX_TIER_CODEX_BIN"] = "relative/codex"
         relative = subprocess.run(
-            [sys.executable, str(DISPATCHER), "probe"],
+            [str(self.launcher), "probe"],
             text=True,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
@@ -555,7 +952,7 @@ class DispatcherTests(unittest.TestCase):
             }
         )
         result = subprocess.run(
-            [str(DISPATCHER), "probe"],
+            [str(self.launcher), "probe"],
             text=True,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
@@ -600,7 +997,7 @@ class DispatcherTests(unittest.TestCase):
             }
         )
         result = subprocess.run(
-            [str(DISPATCHER), "probe"],
+            [str(self.launcher), "probe"],
             text=True,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
@@ -609,6 +1006,137 @@ class DispatcherTests(unittest.TestCase):
         )
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         self.assertFalse(marker.exists())
+
+    def test_launcher_rejects_untrusted_python_before_execution(self) -> None:
+        unsafe_dir = self.base / "unsafe-python-bin"
+        unsafe_dir.mkdir(mode=0o700)
+        marker = self.base / "unsafe-python-ran"
+        fake_python = unsafe_dir / "python3"
+        fake_python.write_text(
+            f"#!/bin/sh\nprintf compromised > {marker}\n", encoding="utf-8"
+        )
+        fake_python.chmod(0o755)
+        unsafe_dir.chmod(0o777)
+        env = os.environ.copy()
+        env.update(
+            {
+                "CODEX_HOME": str(self.home),
+                "CODEX_TIER_CODEX_BIN": str(self.fake),
+                "CODEX_TIER_PYTHON_BIN": str(fake_python),
+            }
+        )
+        result = subprocess.run(
+            [str(self.launcher), "probe"],
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            env=env,
+            check=False,
+        )
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("world-writable Python interpreter path", result.stderr)
+        self.assertFalse(marker.exists())
+
+    def test_launcher_accepts_current_owner_group_writable_python_chain(self) -> None:
+        compatible_dir = self.base / "owner-managed-python-bin"
+        compatible_dir.mkdir(mode=0o770)
+        compatible_dir.chmod(0o770)
+        python_link = compatible_dir / "python3"
+        python_link.symlink_to(Path(sys.executable).resolve())
+        env = os.environ.copy()
+        env.update(
+            {
+                "CODEX_HOME": str(self.home),
+                "CODEX_TIER_CODEX_BIN": str(self.fake),
+                "CODEX_TIER_PYTHON_BIN": str(python_link),
+            }
+        )
+        result = subprocess.run(
+            [str(self.launcher), "probe"],
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            env=env,
+            check=False,
+        )
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+
+    def test_launcher_accepts_normal_dot_relative_invocation(self) -> None:
+        env = os.environ.copy()
+        env.update(
+            {"CODEX_HOME": str(self.home), "CODEX_TIER_CODEX_BIN": str(self.fake)}
+        )
+        result = subprocess.run(
+            ["./codex-tier", "probe"],
+            cwd=self.launcher.parent,
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            env=env,
+            check=False,
+        )
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+
+    def test_codex_shebang_runtime_is_validated_before_execution(self) -> None:
+        unsafe_dir = self.base / "unsafe-codex-runtime-bin"
+        unsafe_dir.mkdir(mode=0o700)
+        marker = self.base / "unsafe-codex-runtime-ran"
+        runtime_name = "codex-test-runtime"
+        unsafe_runtime = unsafe_dir / runtime_name
+        unsafe_runtime.write_text(
+            f"#!/bin/sh\nprintf compromised > {marker}\n", encoding="utf-8"
+        )
+        unsafe_runtime.chmod(0o755)
+        unsafe_dir.chmod(0o777)
+        entrypoint = self.base / "codex-env-runtime"
+        entrypoint.write_text(f"#!/usr/bin/env {runtime_name}\n", encoding="utf-8")
+        entrypoint.chmod(0o755)
+        env = os.environ.copy()
+        env.update(
+            {
+                "PATH": f"{unsafe_dir}{os.pathsep}{env.get('PATH', '')}",
+                "CODEX_HOME": str(self.home),
+                "CODEX_TIER_CODEX_BIN": str(entrypoint),
+                "CODEX_TIER_PYTHON_BIN": str(Path(sys.executable).resolve()),
+            }
+        )
+        result = subprocess.run(
+            [str(self.launcher), "probe"],
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            env=env,
+            check=False,
+        )
+        self.assertEqual(result.returncode, 2)
+        self.assertIn("shebang runtime path", json.loads(result.stdout)["error"])
+        self.assertFalse(marker.exists())
+
+    def test_codex_shebang_rejects_argument_bearing_env_form(self) -> None:
+        entrypoint = self.base / "codex-unsupported-shebang"
+        entrypoint.write_text(
+            "#!/usr/bin/env -S node --no-warnings\n", encoding="utf-8"
+        )
+        entrypoint.chmod(0o755)
+        env = os.environ.copy()
+        env.update(
+            {
+                "CODEX_HOME": str(self.home),
+                "CODEX_TIER_CODEX_BIN": str(entrypoint),
+            }
+        )
+        result = subprocess.run(
+            [str(self.launcher), "probe"],
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            env=env,
+            check=False,
+        )
+        self.assertEqual(result.returncode, 2)
+        self.assertIn(
+            "must name exactly one runtime", json.loads(result.stdout)["error"]
+        )
 
     def test_relative_codex_home_halts_before_subprocess_or_mutation(self) -> None:
         commands = (
@@ -625,7 +1153,7 @@ class DispatcherTests(unittest.TestCase):
             for command in commands:
                 with self.subTest(configured=configured, command=command[0]):
                     result = subprocess.run(
-                        [sys.executable, str(DISPATCHER), *command],
+                        [str(self.launcher), *command],
                         input="task",
                         cwd=self.base,
                         text=True,
@@ -650,7 +1178,7 @@ class DispatcherTests(unittest.TestCase):
                     {"CODEX_HOME": configured, "CODEX_TIER_CODEX_BIN": str(self.fake)}
                 )
                 result = subprocess.run(
-                    [sys.executable, str(DISPATCHER), "probe"],
+                    [str(self.launcher), "probe"],
                     text=True,
                     stdout=subprocess.PIPE,
                     stderr=subprocess.PIPE,
@@ -686,7 +1214,7 @@ class DispatcherTests(unittest.TestCase):
                     }
                 )
                 result = subprocess.run(
-                    [sys.executable, str(DISPATCHER), "probe"],
+                    [str(self.launcher), "probe"],
                     text=True,
                     stdout=subprocess.PIPE,
                     stderr=subprocess.PIPE,
@@ -709,7 +1237,7 @@ class DispatcherTests(unittest.TestCase):
                     }
                 )
                 result = subprocess.run(
-                    [sys.executable, str(DISPATCHER), "probe"],
+                    [str(self.launcher), "probe"],
                     text=True,
                     stdout=subprocess.PIPE,
                     stderr=subprocess.PIPE,
@@ -766,7 +1294,7 @@ class DispatcherTests(unittest.TestCase):
             {"HOME": str(default_home.parent), "CODEX_TIER_CODEX_BIN": str(self.fake)}
         )
         result = subprocess.run(
-            [sys.executable, str(DISPATCHER), "probe"],
+            [str(self.launcher), "probe"],
             text=True,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
@@ -805,6 +1333,28 @@ class DispatcherTests(unittest.TestCase):
                 self.assertEqual(
                     receipt["claim_class"], "dispatcher_configured_and_host_observed"
                 )
+                for path_field, hash_field in (
+                    ("dispatcher_launcher", "dispatcher_launcher_sha256"),
+                    ("dispatcher_runtime", "dispatcher_runtime_sha256"),
+                    ("dispatcher_python", "dispatcher_python_sha256"),
+                    ("codex_executable", "codex_executable_sha256"),
+                    ("codex_runtime", "codex_runtime_sha256"),
+                ):
+                    self.assertEqual(
+                        hashlib.sha256(
+                            Path(receipt[path_field]).read_bytes()
+                        ).hexdigest(),
+                        receipt[hash_field],
+                    )
+                self.assertIn(
+                    receipt["codex_launch_method"],
+                    {"native", "explicit-shebang-runtime"},
+                )
+                if values[2] == "workspace-write":
+                    self.assertEqual(
+                        receipt["observed"]["sandbox_policy"]["writable_roots"],
+                        [],
+                    )
 
     def test_prompt_is_stdin_not_child_argv(self) -> None:
         secret_shape = "PROMPT_ONLY_SENTINEL"
@@ -820,14 +1370,23 @@ class DispatcherTests(unittest.TestCase):
         recorded = json.loads((self.home / "argv.json").read_text())
         self.assertEqual(recorded["process_cwd"], str(self.workdir.resolve()))
 
-    def test_approval_never_requested_by_flag_and_config_override(self) -> None:
-        result = self.run_dispatch()
+    def test_authority_boundaries_are_forced_in_child_argv(self) -> None:
+        result = self.run_dispatch(
+            route="builder", mode="configured_authority_expansion"
+        )
         self.assertEqual(result.returncode, 0)
         recorded = json.loads((self.home / "argv.json").read_text())
         approval_flag = recorded["argv"].index("-a")
         self.assertEqual(recorded["argv"][approval_flag + 1], "never")
         self.assertIn('approval_policy="never"', recorded["argv"])
         self.assertIn("features.multi_agent=false", recorded["argv"])
+        self.assertEqual(
+            recorded["argv"].count("sandbox_workspace_write.network_access=false"),
+            1,
+        )
+        self.assertEqual(
+            recorded["argv"].count("sandbox_workspace_write.writable_roots=[]"), 1
+        )
 
     def test_native_multi_agent_enabled_halts_before_dispatch(self) -> None:
         self._write_fake_mode(native_multi_agent=True)
@@ -840,8 +1399,7 @@ class DispatcherTests(unittest.TestCase):
         )
         result = subprocess.run(
             [
-                sys.executable,
-                str(DISPATCHER),
+                str(self.launcher),
                 "dispatch",
                 "--route",
                 "scout",
@@ -870,8 +1428,7 @@ class DispatcherTests(unittest.TestCase):
         )
         result = subprocess.run(
             [
-                sys.executable,
-                str(DISPATCHER),
+                str(self.launcher),
                 "dispatch",
                 "--route",
                 "scout",
@@ -898,7 +1455,7 @@ class DispatcherTests(unittest.TestCase):
             {"CODEX_HOME": str(self.home), "CODEX_TIER_CODEX_BIN": str(self.fake)}
         )
         enable = subprocess.run(
-            [sys.executable, str(DISPATCHER), "strict-enable"],
+            [str(self.launcher), "strict-enable"],
             text=True,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
@@ -910,7 +1467,7 @@ class DispatcherTests(unittest.TestCase):
         self.assertIn(b"hooks = true\r\n", updated)
         self.assertIn(b"multi_agent = false # strict target\r\n", updated)
         disable = subprocess.run(
-            [sys.executable, str(DISPATCHER), "strict-disable"],
+            [str(self.launcher), "strict-disable"],
             text=True,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
@@ -920,6 +1477,37 @@ class DispatcherTests(unittest.TestCase):
         self.assertEqual(disable.returncode, 0, disable.stdout + disable.stderr)
         self.assertEqual(config.read_bytes(), original)
 
+    def test_strict_enable_does_not_overwrite_concurrent_config_change(self) -> None:
+        config = self.home / "config.toml"
+        config.write_text("[features]\nmulti_agent = true\n", encoding="utf-8")
+        concurrent = b"# concurrent owner update\n[features]\nmulti_agent = true\n"
+
+        def mutate_then_fail(*_: object, **__: object) -> bool:
+            config.write_bytes(concurrent)
+            raise CODEX_TIER.DispatchHalt("synthetic feature probe failure")
+
+        env = {
+            **os.environ,
+            "CODEX_HOME": str(self.home),
+            "CODEX_TIER_CODEX_BIN": str(self.fake),
+        }
+        with (
+            mock.patch.dict(os.environ, env, clear=True),
+            mock.patch.object(
+                CODEX_TIER,
+                "native_multi_agent_enabled",
+                side_effect=mutate_then_fail,
+            ),
+        ):
+            with self.assertRaisesRegex(
+                CODEX_TIER.DispatchHalt, "changed concurrently"
+            ):
+                CODEX_TIER.strict_enable(mock.Mock(), self.home)
+        self.assertEqual(config.read_bytes(), concurrent)
+        state_dir = self.home / "tier-routing"
+        self.assertTrue((state_dir / "strict-config.json").is_file())
+        self.assertTrue((state_dir / "strict-config.backup").is_file())
+
     def test_strict_disable_refuses_config_drift(self) -> None:
         env = os.environ.copy()
         env.update(
@@ -927,7 +1515,7 @@ class DispatcherTests(unittest.TestCase):
         )
         (self.home / "config.toml").write_text("[features]\nmulti_agent = true\n")
         enable = subprocess.run(
-            [sys.executable, str(DISPATCHER), "strict-enable"],
+            [str(self.launcher), "strict-enable"],
             text=True,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
@@ -938,7 +1526,7 @@ class DispatcherTests(unittest.TestCase):
         with (self.home / "config.toml").open("a") as handle:
             handle.write("# user change\n")
         disable = subprocess.run(
-            [sys.executable, str(DISPATCHER), "strict-disable"],
+            [str(self.launcher), "strict-disable"],
             text=True,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
@@ -961,7 +1549,7 @@ class DispatcherTests(unittest.TestCase):
                     {"CODEX_HOME": str(home), "CODEX_TIER_CODEX_BIN": str(self.fake)}
                 )
                 enable = subprocess.run(
-                    [sys.executable, str(DISPATCHER), "strict-enable"],
+                    [str(self.launcher), "strict-enable"],
                     text=True,
                     stdout=subprocess.PIPE,
                     stderr=subprocess.PIPE,
@@ -982,7 +1570,7 @@ class DispatcherTests(unittest.TestCase):
                 config.unlink()
                 config.symlink_to(target)
                 disable = subprocess.run(
-                    [sys.executable, str(DISPATCHER), "strict-disable"],
+                    [str(self.launcher), "strict-disable"],
                     text=True,
                     stdout=subprocess.PIPE,
                     stderr=subprocess.PIPE,
@@ -1024,7 +1612,7 @@ class DispatcherTests(unittest.TestCase):
                     {"CODEX_HOME": str(home), "CODEX_TIER_CODEX_BIN": str(self.fake)}
                 )
                 result = subprocess.run(
-                    [sys.executable, str(DISPATCHER), "strict-disable"],
+                    [str(self.launcher), "strict-disable"],
                     text=True,
                     stdout=subprocess.PIPE,
                     stderr=subprocess.PIPE,
@@ -1056,7 +1644,7 @@ class DispatcherTests(unittest.TestCase):
                     {"CODEX_HOME": str(home), "CODEX_TIER_CODEX_BIN": str(self.fake)}
                 )
                 result = subprocess.run(
-                    [sys.executable, str(DISPATCHER), "strict-enable"],
+                    [str(self.launcher), "strict-enable"],
                     text=True,
                     stdout=subprocess.PIPE,
                     stderr=subprocess.PIPE,
@@ -1098,7 +1686,7 @@ class DispatcherTests(unittest.TestCase):
         env = os.environ.copy()
         env.update({"CODEX_HOME": str(home), "CODEX_TIER_CODEX_BIN": str(self.fake)})
         result = subprocess.run(
-            [sys.executable, str(DISPATCHER), "strict-enable"],
+            [str(self.launcher), "strict-enable"],
             text=True,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
@@ -1119,7 +1707,7 @@ class DispatcherTests(unittest.TestCase):
         config = self.home / "config.toml"
         config.write_text("[features]\nmulti_agent = true\n")
         enable = subprocess.run(
-            [sys.executable, str(DISPATCHER), "strict-enable"],
+            [str(self.launcher), "strict-enable"],
             text=True,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
@@ -1155,7 +1743,7 @@ class DispatcherTests(unittest.TestCase):
             {"CODEX_HOME": str(self.home), "CODEX_TIER_CODEX_BIN": str(self.fake)}
         )
         result = subprocess.run(
-            [sys.executable, str(DISPATCHER), "strict-enable"],
+            [str(self.launcher), "strict-enable"],
             text=True,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
@@ -1190,7 +1778,7 @@ class DispatcherTests(unittest.TestCase):
             {"CODEX_HOME": str(self.home), "CODEX_TIER_CODEX_BIN": str(self.fake)}
         )
         enable = subprocess.run(
-            [sys.executable, str(DISPATCHER), "strict-enable"],
+            [str(self.launcher), "strict-enable"],
             text=True,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
@@ -1201,7 +1789,7 @@ class DispatcherTests(unittest.TestCase):
         active = json.loads((state / "strict-config.json").read_text())
         self.assertEqual(active["state"], "active")
         disable = subprocess.run(
-            [sys.executable, str(DISPATCHER), "strict-disable"],
+            [str(self.launcher), "strict-disable"],
             text=True,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
@@ -1260,6 +1848,7 @@ class DispatcherTests(unittest.TestCase):
             "missing_exclude_slash_tmp",
             "nonboolean_exclude_tmpdir",
             "extra_writable_root",
+            "explicit_empty_writable_roots",
         ):
             with self.subTest(mode=mode):
                 result = self.run_dispatch(route="builder", mode=mode)
@@ -1349,7 +1938,7 @@ class DispatcherTests(unittest.TestCase):
             + "], stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL); "
             + "sys.stdout.buffer.write(b'\\xff'); sys.stdout.buffer.flush()"
         )
-        with self.assertRaisesRegex(CODEX_TIER.DispatchHalt, "UnicodeDecodeError"):
+        with self.assertRaisesRegex(CODEX_TIER.DispatchHalt, "non-UTF-8"):
             CODEX_TIER.run_codex(
                 [sys.executable, "-c", child_code], "task", 10, self.workdir, self.home
             )
@@ -1357,19 +1946,103 @@ class DispatcherTests(unittest.TestCase):
         time.sleep(1.5)
         self.assertFalse(marker.exists())
 
-    def test_communicate_control_flow_propagates_after_cleanup(self) -> None:
+    def test_bounded_process_output_limits_kill_child_process_group(self) -> None:
+        for stream_name in ("stdout", "stderr"):
+            with self.subTest(stream=stream_name):
+                marker = self.base / f"{stream_name}-limit-grandchild"
+                stream = (
+                    "sys.stdout.buffer"
+                    if stream_name == "stdout"
+                    else "sys.stderr.buffer"
+                )
+                child_code = (
+                    "import pathlib,subprocess,sys,time; "
+                    + "subprocess.Popen([sys.executable, '-c', "
+                    + repr(
+                        f"import pathlib,time; time.sleep(1); pathlib.Path({str(marker)!r}).write_text('survived')"
+                    )
+                    + "], stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL); "
+                    + f"{stream}.write(b'x' * 2048); {stream}.flush(); time.sleep(5)"
+                )
+                with self.assertRaisesRegex(
+                    CODEX_TIER.DispatchHalt, "exceeded 1024 bytes"
+                ):
+                    CODEX_TIER.run_process_bounded(
+                        [sys.executable, "-c", child_code],
+                        input_bytes=b"",
+                        cwd=self.workdir,
+                        env=os.environ.copy(),
+                        timeout=10,
+                        stdout_limit=1024,
+                        stderr_limit=1024,
+                    )
+                time.sleep(1.25)
+                self.assertFalse(marker.exists())
+
+    def test_rollout_and_ledger_entry_size_limits_halt(self) -> None:
+        rollout = self.home / "oversized-rollout.jsonl"
+        rollout.write_bytes(b"x" * 65)
+        rollout.chmod(0o600)
+        with mock.patch.object(CODEX_TIER, "MAX_ROLLOUT_BYTES", 64):
+            with self.assertRaisesRegex(CODEX_TIER.DispatchHalt, "exceeds 64 bytes"):
+                CODEX_TIER.read_rollout(rollout)
+
+        ledger_dir = self.home / "tier-routing"
+        ledger_dir.mkdir(mode=0o700, exist_ok=True)
+        ledger = ledger_dir / "ledger.jsonl"
+        ledger.write_text("x" * 65 + "\n", encoding="utf-8")
+        ledger.chmod(0o600)
+        with mock.patch.object(CODEX_TIER, "MAX_LEDGER_ENTRY_BYTES", 64):
+            with self.assertRaisesRegex(CODEX_TIER.DispatchHalt, "size limit"):
+                CODEX_TIER.preflight_ledger(self.home)
+
+        ledger.write_text("x" * 65, encoding="utf-8")
+        with (
+            mock.patch.object(CODEX_TIER, "MAX_LEDGER_ENTRY_BYTES", 1024),
+            mock.patch.object(CODEX_TIER, "MAX_LEDGER_BYTES", 64),
+        ):
+            with self.assertRaisesRegex(CODEX_TIER.DispatchHalt, "total size limit"):
+                CODEX_TIER.preflight_ledger(self.home)
+
+    def test_rollout_candidate_scan_has_aggregate_entry_limit(self) -> None:
+        session_dir = self.home / "sessions" / "2026" / "07" / "13"
+        session_dir.mkdir(parents=True)
+        for index in range(3):
+            (session_dir / f"unrelated-{index}.jsonl").write_text("{}\n")
+        with mock.patch.object(CODEX_TIER, "MAX_ROLLOUT_SCAN_ENTRIES", 5):
+            with self.assertRaisesRegex(CODEX_TIER.DispatchHalt, "entry limit"):
+                CODEX_TIER.find_rollout(
+                    self.home,
+                    "00000000-0000-4000-8000-000000000001",
+                    0,
+                )
+
+    def test_bounded_reader_control_flow_propagates_after_cleanup(self) -> None:
         for interruption in (KeyboardInterrupt(), SystemExit(7)):
             with self.subTest(interruption=type(interruption).__name__):
-                process = mock.Mock(stdin=None, stdout=None, stderr=None, pid=999999999)
-                process.communicate.side_effect = interruption
-                with mock.patch.object(
-                    CODEX_TIER.subprocess, "Popen", return_value=process
+                with (
+                    mock.patch.object(
+                        CODEX_TIER.selectors.DefaultSelector,
+                        "select",
+                        side_effect=interruption,
+                    ),
+                    mock.patch.object(
+                        CODEX_TIER,
+                        "reap_process_group",
+                        wraps=CODEX_TIER.reap_process_group,
+                    ) as reaper,
                 ):
                     with self.assertRaises(type(interruption)):
-                        CODEX_TIER.run_codex(
-                            ["unused"], "task", 10, self.workdir, self.home
+                        CODEX_TIER.run_process_bounded(
+                            [sys.executable, "-c", "import time; time.sleep(30)"],
+                            input_bytes=b"",
+                            cwd=self.workdir,
+                            env=os.environ.copy(),
+                            timeout=10,
+                            stdout_limit=1024,
+                            stderr_limit=1024,
                         )
-                process.wait.assert_called_once_with(timeout=5)
+                reaper.assert_called_once()
 
     def test_empty_and_oversized_prompts_stop_before_model_call(self) -> None:
         for prompt in ("", "x" * (256 * 1024 + 1)):
@@ -1427,8 +2100,7 @@ class DispatcherTests(unittest.TestCase):
             processes.append(
                 subprocess.Popen(
                     [
-                        sys.executable,
-                        str(DISPATCHER),
+                        str(self.launcher),
                         "dispatch",
                         "--route",
                         "scout",
@@ -1494,6 +2166,7 @@ class DispatcherTests(unittest.TestCase):
                 "then",
                 "pattern",
                 "minLength",
+                "maxItems",
             },
         )
         self.assertEqual(
@@ -1513,6 +2186,138 @@ class DispatcherTests(unittest.TestCase):
             passed["receipt"]["output_sha256"],
             hashlib.sha256(passed["result"].encode()).hexdigest(),
         )
+
+    def test_pass_and_halt_envelopes_match_public_contract(self) -> None:
+        receipt_schema = json.loads(
+            (ROOT / "schemas" / "local-dispatch-receipt.schema.json").read_text()
+        )
+        envelope_schema = json.loads(
+            (ROOT / "schemas" / "local-dispatch-envelope.schema.json").read_text()
+        )
+        expanded = expand_envelope_schema(envelope_schema, receipt_schema)
+        passed = self.envelope(self.run_dispatch())
+        halted = self.envelope(self.run_dispatch(mode="wrong_model"))
+        self.assertEqual(validate_local_schema(passed, expanded), [])
+        self.assertEqual(validate_local_schema(halted, expanded), [])
+
+        invalid = json.loads(json.dumps(passed))
+        invalid["result"] = None
+        self.assertTrue(validate_local_schema(invalid, expanded))
+        invalid = json.loads(json.dumps(halted))
+        invalid["result"] = "must be null"
+        self.assertTrue(validate_local_schema(invalid, expanded))
+        invalid = json.loads(json.dumps(passed))
+        invalid["receipt_ref"] = "local-ledger://not-a-hash"
+        self.assertTrue(validate_local_schema(invalid, expanded))
+        invalid = json.loads(json.dumps(passed))
+        invalid["unexpected"] = True
+        self.assertTrue(validate_local_schema(invalid, expanded))
+
+    def test_receipt_check_verifies_critical_semantics_offline(self) -> None:
+        passed = self.envelope(self.run_dispatch())
+        halted = self.envelope(self.run_dispatch(mode="wrong_model"))
+        env = {**os.environ, "CODEX_HOME": str(self.home)}
+        (self.home / "argv.json").unlink(missing_ok=True)
+        for label, envelope in (("pass", passed), ("halt", halted)):
+            with self.subTest(status=label):
+                result = subprocess.run(
+                    [str(self.launcher), "receipt-check"],
+                    input=json.dumps(envelope),
+                    text=True,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    env=env,
+                    check=False,
+                )
+                payload = json.loads(result.stdout)
+                self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+                self.assertEqual(payload["status"], "pass")
+                self.assertEqual(payload["check"], "critical_semantics")
+        self.assertFalse((self.home / "argv.json").exists())
+
+        mutations = (
+            (
+                "policy document",
+                lambda value: value["receipt"]["policy_document"]["routes"][
+                    "scout"
+                ].update(model="gpt-5.6"),
+            ),
+            (
+                "requested route",
+                lambda value: value["receipt"]["requested"].update(effort="max"),
+            ),
+            ("result hash", lambda value: value.update(result="tampered")),
+            (
+                "receipt reference",
+                lambda value: value.update(receipt_ref="local-ledger://bad"),
+            ),
+            ("extra field", lambda value: value.update(unexpected=True)),
+        )
+        for label, mutate in mutations:
+            with self.subTest(tamper=label):
+                invalid = json.loads(json.dumps(passed))
+                mutate(invalid)
+                result = subprocess.run(
+                    [str(self.launcher), "receipt-check"],
+                    input=json.dumps(invalid),
+                    text=True,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    env=env,
+                    check=False,
+                )
+                self.assertEqual(result.returncode, 2)
+                self.assertEqual(json.loads(result.stdout)["status"], "halt")
+
+    def test_receipt_check_file_contract_and_input_bound(self) -> None:
+        envelope = self.envelope(self.run_dispatch())
+        env = {**os.environ, "CODEX_HOME": str(self.home)}
+        receipt_file = self.base / "receipt.json"
+        receipt_file.write_text(json.dumps(envelope), encoding="utf-8")
+        receipt_file.chmod(0o600)
+        result = subprocess.run(
+            [
+                str(self.launcher),
+                "receipt-check",
+                "--receipt-file",
+                str(receipt_file),
+            ],
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            env=env,
+            check=False,
+        )
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+
+        receipt_file.chmod(0o644)
+        result = subprocess.run(
+            [
+                str(self.launcher),
+                "receipt-check",
+                "--receipt-file",
+                str(receipt_file),
+            ],
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            env=env,
+            check=False,
+        )
+        self.assertEqual(result.returncode, 2)
+        self.assertIn("mode 0600", result.stdout)
+
+        result = subprocess.run(
+            [str(self.launcher), "receipt-check"],
+            input="x" * (CODEX_TIER.MAX_RECEIPT_CHECK_BYTES + 1),
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            env=env,
+            check=False,
+        )
+        self.assertEqual(result.returncode, 2)
+        self.assertIn("size limit", result.stdout)
 
     def test_schema_validator_rejects_every_published_constraint_family(self) -> None:
         schema = json.loads(
@@ -1553,6 +2358,17 @@ class DispatcherTests(unittest.TestCase):
                 rollout_sha256=None,
                 error="",
             ),
+            "route resolution mismatch": lambda value: value.update(
+                route_resolved="architect"
+            ),
+            "requested model syntax": lambda value: value["requested"].update(
+                model="provider/model"
+            ),
+            "observed effort enum": lambda value: value["observed"].update(
+                effort="turbo"
+            ),
+            "policy id pattern": lambda value: value.update(policy_id="Bad Policy"),
+            "policy hash pattern": lambda value: value.update(policy_sha256="0"),
         }
         for label, change in cases.items():
             with self.subTest(label=label):
@@ -1603,13 +2419,24 @@ class DispatcherTests(unittest.TestCase):
                 "wrong exclusion type",
                 lambda policy: policy.update(exclude_tmpdir_env_var="false"),
             ),
-            ("extra policy key", lambda policy: policy.update(writable_roots=[])),
+            ("missing roots", lambda policy: policy.pop("writable_roots")),
+            (
+                "nonempty roots",
+                lambda policy: policy.update(writable_roots=["/unexpected"]),
+            ),
+            ("extra policy key", lambda policy: policy.update(unexpected=True)),
         ):
             with self.subTest(workspace_policy=label):
                 value = json.loads(json.dumps(workspace))
                 change(value["observed"]["sandbox_policy"])
                 self.assertTrue(validate_local_schema(value, schema), label)
                 self.assertFalse(ordinary_draft202012_valid(value, schema), label)
+
+        self.write_policy(overrides={"scout": ("gpt-5.6", "none")})
+        custom = self.envelope(self.run_dispatch())["receipt"]
+        self.assertEqual(custom["policy_kind"], "custom")
+        self.assertEqual(validate_local_schema(custom, schema), [])
+        self.assertTrue(ordinary_draft202012_valid(custom, schema))
 
         for label, sandbox, policy in (
             (
@@ -1752,7 +2579,7 @@ class DispatcherTests(unittest.TestCase):
             }
         )
         result = subprocess.run(
-            [sys.executable, str(DISPATCHER), "probe"],
+            [str(self.launcher), "probe"],
             text=True,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,

@@ -4,1339 +4,181 @@
 # Canonical source: https://github.com/0xTitanas/codex-tier-routing
 # Copyright: 2026 0xTitanas
 # SPDX-License-Identifier: MIT
-#
-# Shell launcher: clears dynamic-loader and Python startup variables inherited
-# from the caller, resolves a safe Python 3.11+ interpreter, and execs it in
-# isolated mode so the Python dispatcher runs with a clean environment.
-#
-# Dynamic-loader injection that executes before /bin/sh starts is outside
-# script control; this launcher prevents propagation from this point forward.
-# fmt: off
-''':'
+
+# Security boundary: this launcher is already executing when its checks begin.
+# From this point forward it executes no Python candidate until that candidate's
+# complete lexical and resolved path has passed the local root/current-user
+# trust policy. The Python runtime repeats the same checks as defense in depth.
+
+set -eu
+
+error() {
+  printf 'codex-tier: %s\n' "$1" >&2
+  exit 1
+}
+
+ORIGINAL_PATH=${PATH:-}
 SAFE_PATH=$(command -p getconf PATH 2>/dev/null || printf '/usr/bin:/bin:/usr/sbin:/sbin')
+PATH=$SAFE_PATH
+export PATH
+
 unset PYTHONHOME PYTHONPATH PYTHONSTARTUP PYTHONINSPECT PYTHONUSERBASE
 unset LD_PRELOAD LD_LIBRARY_PATH LD_AUDIT
 unset DYLD_INSERT_LIBRARIES DYLD_LIBRARY_PATH DYLD_FRAMEWORK_PATH
 unset DYLD_FALLBACK_LIBRARY_PATH DYLD_FALLBACK_FRAMEWORK_PATH
 
-# Resolve a Python 3.11+ interpreter. Prefer an explicit override, then search
-# the system path and the caller path (which may include Homebrew, pyenv, etc.).
-# Every candidate is validated for version before use; the selected interpreter
-# is then chain-validated for ownership and writable-ancestor safety by the
-# Python dispatcher itself (validate_executable_chain). The Python process runs
-# with -I so it ignores further environment hooks.
-SEARCH_PATH=$SAFE_PATH${PATH:+:$PATH}
+effective_uid=$(id -u 2>/dev/null || printf '')
+case "$effective_uid" in
+  ''|*[!0-9]*) error "unable to determine the effective UID" ;;
+esac
+
+platform=$(uname -s 2>/dev/null || printf '')
+case "$platform" in
+  Darwin)
+    owner_uid() { stat -f '%u' "$1" 2>/dev/null || printf ''; }
+    permission_mode() { stat -f '%Mp%Lp' "$1" 2>/dev/null || printf ''; }
+    ;;
+  Linux)
+    owner_uid() { stat -c '%u' "$1" 2>/dev/null || printf ''; }
+    permission_mode() { stat -c '%a' "$1" 2>/dev/null || printf ''; }
+    ;;
+  *) error "unsupported platform: ${platform:-unknown}" ;;
+esac
+
+REALPATH_BIN=$(command -v realpath 2>/dev/null || printf '')
+case "$REALPATH_BIN" in
+  /*) ;;
+  *) error "the system realpath utility is unavailable" ;;
+esac
+
+validate_darwin_acl() {
+  [ "$platform" = Darwin ] || return 0
+  acl_output=$(ls -lde "$1" 2>/dev/null) || error "unable to inspect ACLs for $2: $1"
+  if printf '%s\n' "$acl_output" | grep -Eq '^[[:space:]]*[0-9]+:.*[[:space:]]allow[[:space:]]'; then
+    error "refusing an ACL allow entry on $2: $1"
+  fi
+}
+
+validate_chain_components() {
+  chain_path=$1
+  chain_label=$2
+  case "$chain_path" in
+    /*) ;;
+    *) error "$chain_label must be absolute: $chain_path" ;;
+  esac
+
+  chain_current=/
+  chain_rest=${chain_path#/}
+  while :; do
+    [ -e "$chain_current" ] || [ -L "$chain_current" ] || error "missing $chain_label component: $chain_current"
+    chain_uid=$(owner_uid "$chain_current")
+    case "$chain_uid" in
+      ''|*[!0-9]*) error "unable to determine $chain_label ownership: $chain_current" ;;
+    esac
+    if [ "$chain_uid" != 0 ] && [ "$chain_uid" != "$effective_uid" ]; then
+      error "refusing a foreign-owned $chain_label component: $chain_current"
+    fi
+    if [ ! -L "$chain_current" ]; then
+      chain_mode=$(permission_mode "$chain_current")
+      case "$chain_mode" in
+        [0-7][0-7][0-7]|[0-7][0-7][0-7][0-7]) ;;
+        *) error "unable to determine $chain_label permissions: $chain_current" ;;
+      esac
+      chain_without_other=${chain_mode%?}
+      chain_group=${chain_without_other#${chain_without_other%?}}
+      chain_other=${chain_mode#${chain_mode%?}}
+      case "$chain_other" in
+        [2367]) error "refusing a world-writable $chain_label component: $chain_current" ;;
+      esac
+      if [ "$chain_uid" != "$effective_uid" ]; then
+        case "$chain_group" in
+          [2367]) error "refusing a group-writable foreign $chain_label component: $chain_current" ;;
+        esac
+      fi
+      validate_darwin_acl "$chain_current" "$chain_label"
+    fi
+
+    [ -n "$chain_rest" ] || break
+    chain_component=${chain_rest%%/*}
+    case "$chain_component" in
+      ''|.|..) error "$chain_label contains an unsafe lexical component: $chain_path" ;;
+    esac
+    if [ "$chain_current" = / ]; then
+      chain_current=/$chain_component
+    else
+      chain_current=$chain_current/$chain_component
+    fi
+    [ "$chain_component" = "$chain_rest" ] && chain_rest= || chain_rest=${chain_rest#*/}
+  done
+}
+
+validate_trusted_path() {
+  trusted_path=$1
+  trusted_label=$2
+  validate_chain_components "$trusted_path" "$trusted_label"
+  trusted_resolved=$($REALPATH_BIN "$trusted_path" 2>/dev/null || printf '')
+  case "$trusted_resolved" in
+    /*) ;;
+    *) error "unable to resolve $trusted_label: $trusted_path" ;;
+  esac
+  validate_chain_components "$trusted_resolved" "resolved $trusted_label"
+  printf '%s\n' "$trusted_resolved"
+}
+
+case "$0" in
+  /*) launcher_path=$0 ;;
+  */*)
+    launcher_relative=$0
+    while [ "${launcher_relative#./}" != "$launcher_relative" ]; do
+      launcher_relative=${launcher_relative#./}
+    done
+    launcher_path=$PWD/$launcher_relative
+    ;;
+  *)
+    launcher_path=$(PATH="${ORIGINAL_PATH:-$SAFE_PATH}" command -v "$0" 2>/dev/null || printf '')
+    ;;
+esac
+case "$launcher_path" in
+  /*) ;;
+  *) error "unable to resolve the launcher path" ;;
+esac
+launcher_path=$(validate_trusted_path "$launcher_path" "launcher path")
+launcher_dir=${launcher_path%/*}
+runtime_path=$(validate_trusted_path "$launcher_dir/codex-tier.py" "Python runtime path")
+[ -f "$runtime_path" ] && [ -r "$runtime_path" ] || error "Python runtime is not a readable regular file"
+CODEX_TIER_LAUNCHER_PATH=$launcher_path
+export CODEX_TIER_LAUNCHER_PATH
+
+SEARCH_PATH=${ORIGINAL_PATH:-$SAFE_PATH}
 PYTHON_BIN=${CODEX_TIER_PYTHON_BIN:-}
-if [ -z "$PYTHON_BIN" ]; then
+if [ -n "$PYTHON_BIN" ]; then
+  case "$PYTHON_BIN" in
+    /*) ;;
+    *) error "CODEX_TIER_PYTHON_BIN must be absolute" ;;
+  esac
+  PYTHON_BIN=$(validate_trusted_path "$PYTHON_BIN" "Python interpreter path")
+  [ -f "$PYTHON_BIN" ] && [ -x "$PYTHON_BIN" ] || error "Python interpreter is not an executable regular file"
+  if ! "$PYTHON_BIN" -I -c 'import sys; raise SystemExit(0 if sys.version_info >= (3, 11) else 1)' 2>/dev/null; then
+    error "CODEX_TIER_PYTHON_BIN must be Python 3.11 or newer"
+  fi
+else
   for version in python3.11 python3.12 python3.13 python3.14 python3.15 python3; do
     candidate=$(PATH="$SEARCH_PATH" command -v "$version" 2>/dev/null || printf '')
     [ -n "$candidate" ] || continue
-    case "$candidate" in /*) ;; *) continue ;; esac
-    if PATH="$SEARCH_PATH" "$candidate" -I -c 'import sys; raise SystemExit(0 if sys.version_info >= (3, 11) else 1)' 2>/dev/null; then
+    case "$candidate" in
+      /*) ;;
+      *) continue ;;
+    esac
+    candidate=$(validate_trusted_path "$candidate" "Python interpreter path")
+    [ -f "$candidate" ] && [ -x "$candidate" ] || error "Python interpreter is not an executable regular file"
+    if "$candidate" -I -c 'import sys; raise SystemExit(0 if sys.version_info >= (3, 11) else 1)' 2>/dev/null; then
       PYTHON_BIN=$candidate
       break
     fi
   done
 fi
 
-case "$PYTHON_BIN" in
-  /*) ;;
-  *) printf 'codex-tier: python3.11+ is unavailable\n' >&2; exit 1 ;;
-esac
-exec "$PYTHON_BIN" -I "$0" "$@"
-'''
-# fmt: on
-
-"""
-Fail-closed local Codex tier dispatcher.
-
-This wrapper fills the portability gap on Codex surfaces that cannot select a
-registered custom agent. It invokes the stock ``codex exec`` command with a
-fixed route, then verifies the route against Codex's host-written rollout.
-Worker output is returned as untrusted data and never supplies attestation.
-"""
-
-import argparse
-import fcntl
-import hashlib
-import json
-import os
-import re
-import signal
-import shutil
-import stat
-import subprocess
-import sys
-import time
-import tomllib
-import uuid
-from dataclasses import dataclass
-from datetime import UTC, datetime
-from pathlib import Path
-from typing import Any
-
-
-SCHEMA = "codex-tier-routing/local-dispatch-receipt/v1"
-MAX_PROMPT_BYTES = 256 * 1024
-DEFAULT_TIMEOUT_SECONDS = 900
-ROLLOUT_WAIT_SECONDS = 5.0
-STRICT_MANIFEST_SCHEMA = "codex-tier-routing/strict-config/v1"
-
-
-@dataclass(frozen=True)
-class Route:
-    model: str
-    effort: str
-    sandbox: str
-
-
-ROUTES: dict[str, Route] = {
-    "scout": Route("gpt-5.6-luna", "low", "read-only"),
-    "grunt": Route("gpt-5.6-luna", "low", "workspace-write"),
-    "builder": Route("gpt-5.6-terra", "medium", "workspace-write"),
-    "reviewer": Route("gpt-5.6-terra", "high", "read-only"),
-    "architect": Route("gpt-5.6-sol", "xhigh", "read-only"),
-}
-
-
-class DispatchHalt(RuntimeError):
-    """A fail-closed dispatch outcome."""
-
-
-def utc_now() -> str:
-    return datetime.now(UTC).isoformat().replace("+00:00", "Z")
-
-
-def canonical_json(value: Any) -> bytes:
-    return json.dumps(value, sort_keys=True, separators=(",", ":")).encode()
-
-
-def sha256_bytes(value: bytes) -> str:
-    return hashlib.sha256(value).hexdigest()
-
-
-def sha256_file(path: Path) -> str:
-    digest = hashlib.sha256()
-    with path.open("rb") as handle:
-        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
-            digest.update(chunk)
-    return digest.hexdigest()
-
-
-def resolve_codex_home() -> Path:
-    """Return the one canonical, safe Codex home used by this invocation."""
-    if "CODEX_HOME" not in os.environ:
-        default = Path.home() / ".codex"
-        return preflight_home(default, lexical=str(default))
-    configured = os.environ["CODEX_HOME"]
-    # Check lexical absoluteness before expansion: accepting ``~`` or a
-    # relative spelling would make an environment override context-dependent.
-    if not configured or not Path(configured).is_absolute():
-        raise DispatchHalt("CODEX_HOME must be an absolute path")
-    candidate = Path(configured)
-    return preflight_home(candidate, lexical=configured)
-
-
-def child_environment(home: Path) -> dict[str, str]:
-    """Launch Codex with a minimal, explicit environment.
-
-    The dispatcher validates every path it uses, so it does not need arbitrary
-    caller variables. Propagating the full invoking environment would leak
-    loader injection variables (``LD_PRELOAD``, ``DYLD_*``), Python startup
-    hooks (``PYTHONPATH``, ``PYTHONSTARTUP``), and other state that could
-    execute attacker-controlled code inside a Codex subprocess.
-    """
-    environment: dict[str, str] = {}
-    for name in ("HOME", "PATH", "USER", "SHELL", "TERM", "TMPDIR", "LANG", "LC_ALL"):
-        value = os.environ.get(name)
-        if value is not None:
-            environment[name] = value
-    environment["CODEX_HOME"] = str(home)
-    configured_bin = os.environ.get("CODEX_TIER_CODEX_BIN")
-    if configured_bin is not None:
-        environment["CODEX_TIER_CODEX_BIN"] = configured_bin
-    return environment
-
-
-def validate_ledger_lines(handle: Any) -> str | None:
-    previous_hash = None
-    line_number = 0
-    handle.seek(0)
-    for line in handle:
-        if not line.strip():
-            continue
-        line_number += 1
-        try:
-            previous = json.loads(line)
-            if not isinstance(previous, dict):
-                raise TypeError("ledger entry is not an object")
-            entry_hash = previous.pop("entry_hash")
-            if previous.get("previous_hash") != previous_hash:
-                raise ValueError("broken previous hash")
-            if sha256_bytes(canonical_json(previous)) != entry_hash:
-                raise ValueError("entry hash mismatch")
-            previous_hash = entry_hash
-        except (json.JSONDecodeError, KeyError, TypeError, ValueError) as exc:
-            raise DispatchHalt(
-                f"local receipt ledger is invalid at entry {line_number}"
-            ) from exc
-    return previous_hash
-
-
-def ensure_private_dir(path: Path) -> None:
-    if path.is_symlink():
-        raise DispatchHalt(f"refusing symlinked private directory: {path}")
-    path.mkdir(mode=0o700, parents=True, exist_ok=True)
-    if not path.is_dir() or path.stat().st_uid != os.geteuid():
-        raise DispatchHalt(
-            f"private directory is not owned by the current identity: {path}"
-        )
-    os.chmod(path, 0o700)
-    reject_darwin_allow_acl(path, label="private directory")
-
-
-def reject_darwin_allow_acl(path: Path, *, label: str) -> None:
-    """Reject macOS ACL grants while permitting normal deny-only home ACLs."""
-    if sys.platform != "darwin":
-        return
-    try:
-        result = subprocess.run(
-            ["/bin/ls", "-lde", str(path)],
-            text=True,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            timeout=5,
-            check=False,
-        )
-    except (OSError, subprocess.SubprocessError) as exc:
-        raise DispatchHalt(f"unable to inspect ACLs for {label}") from exc
-    if result.returncode != 0:
-        raise DispatchHalt(f"unable to inspect ACLs for {label}")
-    if re.search(r"(?m)^\s*\d+:.*\sallow\s", result.stdout):
-        raise DispatchHalt(f"refusing ACL allow entry on {label}")
-
-
-def preflight_home(path: Path, *, lexical: str | None = None) -> Path:
-    """Validate the complete lexical home chain before resolving the path."""
-    raw = str(path) if lexical is None else lexical
-    if not raw or not Path(raw).is_absolute():
-        raise DispatchHalt("CODEX_HOME must be an absolute path")
-    components = [component for component in raw.split("/") if component]
-    if any(component in {".", ".."} for component in components):
-        raise DispatchHalt("CODEX_HOME must not contain . or .. components")
-
-    current = Path("/")
-    chain = [current]
-    for component in components:
-        current /= component
-        chain.append(current)
-
-    effective_uid = os.geteuid()
-    for component in chain:
-        try:
-            details = os.lstat(component)
-        except OSError as exc:
-            raise DispatchHalt(
-                f"Codex home must be an existing directory: {component}"
-            ) from exc
-        if stat.S_ISLNK(details.st_mode):
-            raise DispatchHalt(f"refusing symlinked Codex home component: {component}")
-        if not stat.S_ISDIR(details.st_mode):
-            raise DispatchHalt(f"Codex home component is not a directory: {component}")
-        if details.st_uid not in {0, effective_uid}:
-            raise DispatchHalt(
-                f"Codex home component has an untrusted owner: {component}"
-            )
-        reject_darwin_allow_acl(component, label="Codex home component")
-        mode = stat.S_IMODE(details.st_mode)
-        if mode & 0o022 and not mode & stat.S_ISVTX:
-            raise DispatchHalt(
-                f"Codex home component is non-sticky group/world-writable: {component}"
-            )
-
-    home_details = os.lstat(path)
-    if home_details.st_uid != effective_uid:
-        raise DispatchHalt("Codex home is not owned by the current identity")
-    if stat.S_IMODE(home_details.st_mode) & 0o022:
-        raise DispatchHalt("Codex home is group/world-writable")
-    return path.resolve()
-
-
-def validate_executable_chain(path: Path, *, label: str) -> Path:
-    """Validate a lexical executable path and every component it traverses."""
-    raw = str(path)
-    if not raw or not path.is_absolute():
-        raise DispatchHalt(f"{label} must be an absolute path")
-    components = [component for component in raw.split("/") if component]
-    if any(component in {".", ".."} for component in components):
-        raise DispatchHalt(f"{label} must not contain . or .. components")
-
-    effective_uid = os.geteuid()
-    current = Path("/")
-    for component in components:
-        current /= component
-        try:
-            status = current.lstat()
-        except OSError as exc:
-            raise DispatchHalt(f"{label} component is missing: {current}") from exc
-        if stat.S_ISLNK(status.st_mode):
-            raise DispatchHalt(f"refusing symlinked {label} component: {current}")
-        if status.st_uid not in {0, effective_uid}:
-            raise DispatchHalt(f"refusing foreign-owned {label} component: {current}")
-        mode = stat.S_IMODE(status.st_mode)
-        if mode & 0o022:
-            raise DispatchHalt(f"refusing writable {label} component: {current}")
-        reject_darwin_allow_acl(current, label=f"{label} component")
-    return path.resolve()
-
-
-def preflight_ledger(home: Path) -> None:
-    ledger_dir = home / "tier-routing"
-    ensure_private_dir(ledger_dir)
-    ledger = ledger_dir / "ledger.jsonl"
-    if ledger.is_symlink():
-        raise DispatchHalt("refusing symlinked local receipt ledger")
-    if ledger.exists():
-        current_owner_regular(ledger, label="local receipt ledger")
-        flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
-        try:
-            descriptor = os.open(ledger, flags)
-        except OSError as exc:
-            raise DispatchHalt(
-                f"unable to open local receipt ledger safely: {type(exc).__name__}"
-            ) from exc
-        with os.fdopen(descriptor, "r", encoding="utf-8") as handle:
-            fcntl.flock(handle.fileno(), fcntl.LOCK_SH)
-            validate_ledger_lines(handle)
-            fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
-
-
-def resolve_codex() -> str:
-    configured = os.environ.get("CODEX_TIER_CODEX_BIN")
-    executable = configured or shutil.which("codex")
-    if not executable:
-        raise DispatchHalt("codex executable is unavailable")
-    resolved = validate_executable_chain(
-        Path(executable).expanduser(), label="Codex executable path"
-    )
-    if not resolved.is_file() or not os.access(resolved, os.X_OK):
-        raise DispatchHalt("codex executable is not an executable regular file")
-    return str(resolved)
-
-
-def codex_version(executable: str, home: Path) -> str:
-    try:
-        result = subprocess.run(
-            [executable, "--version"],
-            stdin=subprocess.DEVNULL,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            text=True,
-            encoding="utf-8",
-            env=child_environment(home),
-            timeout=15,
-            check=False,
-        )
-    except (OSError, subprocess.TimeoutExpired) as exc:
-        raise DispatchHalt(
-            f"unable to inspect codex version: {type(exc).__name__}"
-        ) from exc
-    if result.returncode != 0:
-        raise DispatchHalt("codex --version failed")
-    return result.stdout.strip() or result.stderr.strip()
-
-
-def native_multi_agent_enabled(
-    executable: str,
-    home: Path,
-    *,
-    cwd: Path | None = None,
-    force_disabled: bool = False,
-) -> bool:
-    command = [executable]
-    if force_disabled:
-        command.extend(["-c", "features.multi_agent=false"])
-    command.extend(["features", "list"])
-    try:
-        result = subprocess.run(
-            command,
-            cwd=cwd,
-            stdin=subprocess.DEVNULL,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            text=True,
-            encoding="utf-8",
-            env=child_environment(home),
-            timeout=15,
-            check=False,
-        )
-    except (OSError, subprocess.TimeoutExpired) as exc:
-        raise DispatchHalt(
-            f"unable to inspect native multi-agent state: {type(exc).__name__}"
-        ) from exc
-    if result.returncode != 0:
-        raise DispatchHalt("codex features list failed")
-    matches = [
-        line.split()[-1]
-        for line in result.stdout.splitlines()
-        if line.split() and line.split()[0] == "multi_agent"
-    ]
-    if len(matches) != 1 or matches[0] not in {"true", "false"}:
-        raise DispatchHalt("codex did not report one native multi-agent feature state")
-    return matches[0] == "true"
-
-
-def reject_profile_overrides(home: Path) -> None:
-    for path in sorted(home.glob("*.config.toml")):
-        current_owner_regular(path, label="Codex profile config")
-        try:
-            parsed = tomllib.loads(path.read_text(encoding="utf-8"))
-        except (OSError, UnicodeError, tomllib.TOMLDecodeError) as exc:
-            raise DispatchHalt(f"Codex profile config is invalid: {path.name}") from exc
-        value = parsed.get("features", {}).get("multi_agent")
-        if value is not None and value is not False:
-            raise DispatchHalt(
-                f"profile {path.name} overrides native multi-agent; set it to false first"
-            )
-
-
-def strict_paths(home: Path) -> tuple[Path, Path, Path]:
-    state_dir = home / "tier-routing"
-    ensure_private_dir(state_dir)
-    return (
-        home / "config.toml",
-        state_dir / "strict-config.json",
-        state_dir / "strict-config.backup",
-    )
-
-
-def current_owner_regular(path: Path, *, label: str) -> os.stat_result:
-    if path.is_symlink():
-        raise DispatchHalt(f"refusing symlinked {label}")
-    details = path.stat()
-    if not path.is_file() or details.st_uid != os.geteuid():
-        raise DispatchHalt(f"{label} is not a current-owner regular file")
-    if stat.S_IMODE(details.st_mode) & 0o022:
-        raise DispatchHalt(f"{label} is group/world-writable")
-    reject_darwin_allow_acl(path, label=label)
-    return details
-
-
-def atomic_write(path: Path, data: bytes, mode: int) -> None:
-    temporary = path.with_name(f".{path.name}.codex-tier-{uuid.uuid4().hex}")
-    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0)
-    descriptor = None
-    try:
-        descriptor = os.open(temporary, flags, mode)
-        with os.fdopen(descriptor, "wb") as handle:
-            descriptor = None
-            os.fchmod(handle.fileno(), mode)
-            handle.write(data)
-            handle.flush()
-            os.fsync(handle.fileno())
-        os.replace(temporary, path)
-        directory = os.open(path.parent, os.O_RDONLY)
-        try:
-            os.fsync(directory)
-        finally:
-            os.close(directory)
-    except OSError as exc:
-        if descriptor is not None:
-            os.close(descriptor)
-        try:
-            temporary.unlink()
-        except FileNotFoundError:
-            pass
-        raise DispatchHalt(
-            f"unable to update strict configuration: {type(exc).__name__}"
-        ) from exc
-
-
-def strict_candidate(original: bytes) -> bytes:
-    try:
-        text = original.decode("utf-8")
-        parsed = tomllib.loads(text)
-    except (UnicodeDecodeError, tomllib.TOMLDecodeError) as exc:
-        raise DispatchHalt("config.toml is not valid UTF-8 TOML") from exc
-    features = parsed.get("features")
-    if features is not None and not isinstance(features, dict):
-        raise DispatchHalt("config.toml features value is not a table")
-    lines = text.splitlines(keepends=True)
-    headers = [
-        index
-        for index, line in enumerate(lines)
-        if re.fullmatch(r"[ \t]*\[features\][ \t]*(?:#.*?)?(?:\r?\n)?", line)
-    ]
-    newline = "\r\n" if "\r\n" in text else "\n"
-    if not headers:
-        if features is not None:
-            raise DispatchHalt(
-                "config.toml defines features without a simple [features] table; edit manually"
-            )
-        prefix = "" if not text or text.endswith(("\n", "\r")) else newline
-        block = (
-            f"{prefix}{newline if text else ''}"
-            "# codex-tier-routing strict mode: native subagent spawning disabled"
-            f"{newline}[features]{newline}multi_agent = false{newline}"
-        )
-        candidate = (text + block).encode()
-    elif len(headers) == 1:
-        start = headers[0]
-        end = len(lines)
-        for index in range(start + 1, len(lines)):
-            if re.match(r"[ \t]*\[", lines[index]):
-                end = index
-                break
-        assignments = []
-        pattern = re.compile(
-            r"^([ \t]*multi_agent[ \t]*=[ \t]*)(true|false)([ \t]*(?:#.*?)?)(\r?\n)?$"
-        )
-        for index in range(start + 1, end):
-            match = pattern.fullmatch(lines[index])
-            if match:
-                assignments.append((index, match))
-        if len(assignments) > 1:
-            raise DispatchHalt("config.toml contains multiple multi_agent assignments")
-        if assignments:
-            index, match = assignments[0]
-            lines[index] = (
-                f"{match.group(1)}false{match.group(3)}{match.group(4) or ''}"
-            )
-        else:
-            lines.insert(start + 1, f"multi_agent = false{newline}")
-        candidate = "".join(lines).encode()
-    else:
-        raise DispatchHalt("config.toml contains multiple [features] tables")
-    try:
-        reparsed = tomllib.loads(candidate.decode("utf-8"))
-    except (UnicodeDecodeError, tomllib.TOMLDecodeError) as exc:
-        raise DispatchHalt("strict configuration candidate is invalid") from exc
-    if reparsed.get("features", {}).get("multi_agent") is not False:
-        raise DispatchHalt("strict configuration candidate did not disable multi_agent")
-    return candidate
-
-
-def read_strict_manifest(path: Path) -> dict[str, Any] | None:
-    if not path.exists():
-        return None
-    current_owner_regular(path, label="strict-mode manifest")
-    try:
-        value = json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, UnicodeError, json.JSONDecodeError) as exc:
-        raise DispatchHalt("strict-mode manifest is invalid") from exc
-    required = {
-        "schema",
-        "before_exists",
-        "before_mode",
-        "before_sha256",
-        "after_sha256",
-        "state",
-    }
-    if (
-        not isinstance(value, dict)
-        or set(value) != required
-        or value.get("schema") != STRICT_MANIFEST_SCHEMA
-        or value.get("state") not in {"pending", "active", "disabling"}
-    ):
-        raise DispatchHalt("strict-mode manifest is invalid")
-    return value
-
-
-def strict_enable(_: argparse.Namespace, home: Path | None = None) -> int:
-    home = resolve_codex_home() if home is None else home
-    executable = resolve_codex()
-    config = home / "config.toml"
-    # exists() is false for dangling links, so reject either form before every
-    # config existence, read, or recovery decision below.
-    if config.is_symlink():
-        raise DispatchHalt("refusing symlinked config.toml")
-    _, manifest_path, backup = strict_paths(home)
-    reject_profile_overrides(home)
-    manifest = read_strict_manifest(manifest_path)
-    if manifest is not None:
-        if manifest["state"] == "disabling":
-            strict_disable(_, home)
-            return strict_enable(_, home)
-        if config.exists():
-            current_owner_regular(config, label="config.toml")
-        current = config.read_bytes() if config.exists() else b""
-        current_hash = sha256_bytes(current)
-        if manifest["state"] == "pending" and current_hash == manifest["after_sha256"]:
-            if native_multi_agent_enabled(executable, home):
-                raise DispatchHalt("pending strict configuration is not effective")
-            manifest["state"] = "active"
-            atomic_write(manifest_path, canonical_json(manifest) + b"\n", 0o600)
-        elif (
-            manifest["state"] == "pending" and current_hash == manifest["before_sha256"]
-        ):
-            manifest_path.unlink()
-            backup.unlink()
-            return strict_enable(_, home)
-        elif current_hash != manifest["after_sha256"]:
-            raise DispatchHalt("managed strict configuration has drifted")
-        if native_multi_agent_enabled(executable, home):
-            raise DispatchHalt("managed strict configuration is not effective")
-        print(
-            json.dumps(
-                {"status": "pass", "strict_mode": "already_active"}, sort_keys=True
-            )
-        )
-        return 0
-    before_exists = config.exists()
-    if before_exists:
-        details = current_owner_regular(config, label="config.toml")
-        original = config.read_bytes()
-        mode = stat.S_IMODE(details.st_mode)
-    else:
-        original = b""
-        mode = 0o600
-    candidate = strict_candidate(original)
-    if candidate == original and not native_multi_agent_enabled(executable, home):
-        print(
-            json.dumps(
-                {"status": "pass", "strict_mode": "already_effective_unmanaged"},
-                sort_keys=True,
-            )
-        )
-        return 0
-    if backup.exists():
-        current_owner_regular(backup, label="strict-mode backup")
-        if backup.read_bytes() != original:
-            raise DispatchHalt(
-                "orphaned strict-mode backup does not match current config"
-            )
-        backup.unlink()
-    atomic_write(backup, original, 0o600)
-    manifest = {
-        "schema": STRICT_MANIFEST_SCHEMA,
-        "before_exists": before_exists,
-        "before_mode": mode if before_exists else None,
-        "before_sha256": sha256_bytes(original),
-        "after_sha256": sha256_bytes(candidate),
-        "state": "pending",
-    }
-    atomic_write(manifest_path, canonical_json(manifest) + b"\n", 0o600)
-    try:
-        atomic_write(config, candidate, mode)
-        if native_multi_agent_enabled(executable, home):
-            raise DispatchHalt("Codex still reports native multi-agent enabled")
-        manifest["state"] = "active"
-        atomic_write(manifest_path, canonical_json(manifest) + b"\n", 0o600)
-    except BaseException:
-        if before_exists:
-            atomic_write(config, original, mode)
-        else:
-            try:
-                config.unlink()
-            except FileNotFoundError:
-                pass
-        try:
-            backup.unlink()
-        except FileNotFoundError:
-            pass
-        try:
-            manifest_path.unlink()
-        except FileNotFoundError:
-            pass
-        raise
-    print(
-        json.dumps(
-            {"status": "pass", "strict_mode": "enabled", "restart_required": True},
-            sort_keys=True,
-        )
-    )
-    return 0
-
-
-def strict_disable(_: argparse.Namespace, home: Path | None = None) -> int:
-    home = resolve_codex_home() if home is None else home
-    # This check must precede strict_paths(): strict-disable is also a
-    # recovery operation, and strict_paths creates/chmods tier-routing.
-    # is_symlink covers both live and dangling links.
-    config = home / "config.toml"
-    if config.is_symlink():
-        raise DispatchHalt("refusing symlinked config.toml")
-    config, manifest_path, backup = strict_paths(home)
-    manifest = read_strict_manifest(manifest_path)
-    if manifest is None:
-        print(
-            json.dumps({"status": "pass", "strict_mode": "not_managed"}, sort_keys=True)
-        )
-        return 0
-    current_owner_regular(backup, label="strict-mode backup")
-    original = backup.read_bytes()
-    if sha256_bytes(original) != manifest["before_sha256"]:
-        raise DispatchHalt("strict-mode backup hash mismatch")
-    if config.is_symlink():
-        raise DispatchHalt("refusing symlinked config.toml")
-    if config.exists():
-        current_owner_regular(config, label="config.toml")
-    current = config.read_bytes() if config.exists() else b""
-    current_hash = sha256_bytes(current)
-    if manifest["state"] == "active":
-        if current_hash != manifest["after_sha256"]:
-            raise DispatchHalt(
-                "managed strict configuration has drifted; refusing to overwrite it"
-            )
-        manifest["state"] = "disabling"
-        atomic_write(manifest_path, canonical_json(manifest) + b"\n", 0o600)
-    elif current_hash not in {manifest["after_sha256"], manifest["before_sha256"]}:
-        raise DispatchHalt(
-            "managed strict configuration has drifted; refusing to overwrite it"
-        )
-    if current_hash != manifest["before_sha256"]:
-        if manifest["before_exists"]:
-            atomic_write(config, original, manifest["before_mode"])
-        else:
-            config.unlink()
-    manifest_path.unlink()
-    backup.unlink()
-    print(
-        json.dumps(
-            {"status": "pass", "strict_mode": "disabled", "restart_required": True},
-            sort_keys=True,
-        )
-    )
-    return 0
-
-
-class Slot:
-    """Cross-process four-slot cap using non-blocking advisory locks."""
-
-    def __init__(self, home: Path):
-        self._dir = home / "tier-routing" / "locks"
-        self._file = None
-
-    def __enter__(self) -> "Slot":
-        ensure_private_dir(self._dir)
-        for index in range(4):
-            path = self._dir / f"dispatch-{index}.lock"
-            flags = os.O_RDWR | os.O_CREAT | getattr(os, "O_NOFOLLOW", 0)
-            try:
-                descriptor = os.open(path, flags, 0o600)
-            except OSError as exc:
-                raise DispatchHalt(
-                    f"unable to open dispatch lock safely: {type(exc).__name__}"
-                ) from exc
-            handle = os.fdopen(descriptor, "a+")
-            os.fchmod(handle.fileno(), 0o600)
-            try:
-                fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
-            except BlockingIOError:
-                handle.close()
-                continue
-            self._file = handle
-            return self
-        raise DispatchHalt("concurrency cap reached (four active dispatches)")
-
-    def __exit__(self, *_: object) -> None:
-        if self._file is not None:
-            fcntl.flock(self._file.fileno(), fcntl.LOCK_UN)
-            self._file.close()
-
-
-def read_prompt(args: argparse.Namespace) -> str:
-    if args.prompt_file is not None:
-        path = Path(args.prompt_file).expanduser()
-        descriptor = None
-        try:
-            descriptor = os.open(
-                path,
-                os.O_RDONLY | os.O_NONBLOCK | getattr(os, "O_NOFOLLOW", 0),
-            )
-            details = os.fstat(descriptor)
-            if not stat.S_ISREG(details.st_mode):
-                raise DispatchHalt("prompt file must be regular")
-            if details.st_uid != os.geteuid() or details.st_mode & 0o077:
-                raise DispatchHalt("prompt file must be current-owner and owner-only")
-            flags = fcntl.fcntl(descriptor, fcntl.F_GETFL)
-            fcntl.fcntl(descriptor, fcntl.F_SETFL, flags & ~os.O_NONBLOCK)
-            raw = os.read(descriptor, MAX_PROMPT_BYTES + 1)
-        except DispatchHalt:
-            raise
-        except OSError as exc:
-            raise DispatchHalt(
-                f"unable to read prompt file: {type(exc).__name__}"
-            ) from exc
-        finally:
-            if descriptor is not None:
-                try:
-                    os.close(descriptor)
-                except OSError:
-                    pass
-        try:
-            prompt = raw.decode("utf-8")
-        except UnicodeError as exc:
-            raise DispatchHalt("prompt file must be UTF-8") from exc
-    else:
-        try:
-            raw = sys.stdin.buffer.read(MAX_PROMPT_BYTES + 1)
-            prompt = raw.decode("utf-8")
-        except UnicodeError as exc:
-            raise DispatchHalt("stdin prompt must be UTF-8") from exc
-
-    encoded = prompt.encode("utf-8")
-    if not prompt.strip():
-        raise DispatchHalt("prompt is empty")
-    if b"\x00" in encoded:
-        raise DispatchHalt("prompt contains a NUL byte")
-    if len(encoded) > MAX_PROMPT_BYTES:
-        raise DispatchHalt(f"prompt exceeds {MAX_PROMPT_BYTES} bytes")
-    return prompt
-
-
-def parse_exec_stream(raw: str) -> tuple[str, str]:
-    thread_ids: list[str] = []
-    messages: list[str] = []
-    terminal = False
-    for line in raw.splitlines():
-        if not line.strip():
-            continue
-        try:
-            event = json.loads(line)
-        except json.JSONDecodeError as exc:
-            raise DispatchHalt("codex exec emitted malformed JSONL") from exc
-        if not isinstance(event, dict):
-            raise DispatchHalt("codex exec emitted a non-object event")
-        if event.get("type") == "thread.started":
-            thread_id = event.get("thread_id")
-            if isinstance(thread_id, str) and thread_id:
-                thread_ids.append(thread_id)
-        elif event.get("type") == "item.completed":
-            item = event.get("item")
-            if isinstance(item, dict) and item.get("type") == "agent_message":
-                text = item.get("text")
-                if isinstance(text, str):
-                    messages.append(text)
-        elif event.get("type") == "turn.completed":
-            terminal = True
-
-    if len(thread_ids) != 1:
-        raise DispatchHalt("codex exec did not emit exactly one thread identity")
-    try:
-        parsed_thread = uuid.UUID(thread_ids[0])
-    except ValueError as exc:
-        raise DispatchHalt("codex exec emitted an invalid thread identity") from exc
-    if str(parsed_thread) != thread_ids[0].lower():
-        raise DispatchHalt("codex exec emitted a non-canonical thread identity")
-    if not terminal:
-        raise DispatchHalt("codex exec did not emit a terminal turn event")
-    if not messages:
-        raise DispatchHalt("codex exec did not emit a final agent message")
-    return thread_ids[0], "\n".join(messages)
-
-
-def find_rollout(home: Path, thread_id: str, earliest_mtime_ns: int) -> Path:
-    sessions = home / "sessions"
-    deadline = time.monotonic() + ROLLOUT_WAIT_SECONDS
-    matches: list[Path] = []
-    while time.monotonic() < deadline:
-        candidates = (
-            list(sessions.glob(f"**/rollout-*{thread_id}.jsonl"))
-            if sessions.is_dir()
-            else []
-        )
-        try:
-            matches = [
-                path
-                for path in candidates
-                if path.is_file()
-                and path.stat().st_mtime_ns >= earliest_mtime_ns - 1_000_000_000
-            ]
-        except OSError as exc:
-            raise DispatchHalt(
-                f"unable to inspect rollout candidates: {type(exc).__name__}"
-            ) from exc
-        if len(matches) == 1:
-            break
-        if len(matches) > 1:
-            raise DispatchHalt("multiple rollout records matched the child session")
-        time.sleep(0.05)
-    if len(matches) != 1:
-        raise DispatchHalt("host-written rollout record is unavailable")
-    path = matches[0]
-    validate_rollout_path(home, path)
-    return path
-
-
-def validate_rollout_path(home: Path, path: Path) -> None:
-    """Require an owner-controlled, non-writable chain from home to rollout."""
-    try:
-        relative = path.relative_to(home)
-    except ValueError as exc:
-        raise DispatchHalt("rollout record is outside the Codex home") from exc
-    current = home
-    for index, component in enumerate(relative.parts):
-        current /= component
-        try:
-            details = os.lstat(current)
-        except OSError as exc:
-            raise DispatchHalt("unable to inspect rollout provenance path") from exc
-        if stat.S_ISLNK(details.st_mode):
-            raise DispatchHalt("rollout provenance path contains a symlink")
-        is_final = index == len(relative.parts) - 1
-        expected_type = stat.S_ISREG if is_final else stat.S_ISDIR
-        if not expected_type(details.st_mode):
-            raise DispatchHalt("rollout provenance path has an unexpected object type")
-        if details.st_uid != os.geteuid():
-            raise DispatchHalt(
-                "rollout provenance path is not owned by the current identity"
-            )
-        if stat.S_IMODE(details.st_mode) & 0o022:
-            raise DispatchHalt("rollout provenance path is group/world-writable")
-        reject_darwin_allow_acl(current, label="rollout provenance path")
-
-
-def read_rollout(path: Path) -> bytes:
-    try:
-        descriptor = os.open(path, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
-        details = os.fstat(descriptor)
-        if (
-            not stat.S_ISREG(details.st_mode)
-            or details.st_uid != os.geteuid()
-            or stat.S_IMODE(details.st_mode) & 0o022
-        ):
-            os.close(descriptor)
-            raise DispatchHalt("rollout record is not a current-owner regular file")
-        with os.fdopen(descriptor, "rb") as handle:
-            return handle.read()
-    except DispatchHalt:
-        raise
-    except OSError as exc:
-        raise DispatchHalt(
-            f"unable to read rollout record: {type(exc).__name__}"
-        ) from exc
-
-
-def load_observation(path: Path) -> tuple[dict[str, Any], bytes]:
-    deadline = time.monotonic() + ROLLOUT_WAIT_SECONDS
-    last_error = "rollout record is incomplete"
-    while time.monotonic() < deadline:
-        raw = read_rollout(path)
-        metas = []
-        turns = []
-        malformed = False
-        for line in raw.splitlines():
-            try:
-                event = json.loads(line)
-            except json.JSONDecodeError:
-                malformed = True
-                break
-            if not isinstance(event, dict) or not isinstance(
-                event.get("payload"), dict
-            ):
-                continue
-            if event.get("type") == "session_meta":
-                metas.append(event["payload"])
-            elif event.get("type") == "turn_context":
-                turns.append(event["payload"])
-        if len(metas) > 1 or len(turns) > 1:
-            raise DispatchHalt(
-                "rollout record must contain one session metadata and one turn context"
-            )
-        if not malformed and len(metas) == 1 and len(turns) == 1:
-            return {"meta": metas[0], "turn": turns[0]}, raw
-        last_error = (
-            "rollout record contains malformed JSONL"
-            if malformed
-            else "rollout record is incomplete"
-        )
-        time.sleep(0.05)
-    raise DispatchHalt(last_error)
-
-
-def sandbox_name(turn: dict[str, Any]) -> str | None:
-    policy = turn.get("sandbox_policy")
-    return policy.get("type") if isinstance(policy, dict) else None
-
-
-def verify_observation(
-    observation: dict[str, Any],
-    *,
-    thread_id: str,
-    route: Route,
-    workdir: Path,
-) -> dict[str, Any]:
-    meta = observation["meta"]
-    turn = observation["turn"]
-    observed = {
-        "session_id": meta.get("session_id") or meta.get("id"),
-        "source": meta.get("source"),
-        "originator": meta.get("originator"),
-        "model_provider": meta.get("model_provider"),
-        "model": turn.get("model"),
-        "effort": turn.get("effort"),
-        "sandbox": sandbox_name(turn),
-        "sandbox_policy": turn.get("sandbox_policy"),
-        "approval_policy": turn.get("approval_policy"),
-        "cwd": turn.get("cwd"),
-        "session_cwd": meta.get("cwd"),
-        "cli_version": meta.get("cli_version"),
-    }
-    if observed["cli_version"] is not None and not isinstance(
-        observed["cli_version"], str
-    ):
-        raise DispatchHalt("host observation mismatch: cli_version")
-    expected = {
-        "session_id": thread_id,
-        "source": "exec",
-        "originator": "codex_exec",
-        "model_provider": "openai",
-        "model": route.model,
-        "effort": route.effort,
-        "sandbox": route.sandbox,
-        "approval_policy": "never",
-        "cwd": str(workdir),
-        "session_cwd": str(workdir),
-    }
-    mismatches = [
-        key
-        for key, expected_value in expected.items()
-        if observed.get(key) != expected_value
-    ]
-    if mismatches:
-        raise DispatchHalt(
-            "host observation mismatch: " + ", ".join(sorted(mismatches))
-        )
-    policy = observed["sandbox_policy"]
-    if not isinstance(policy, dict):
-        raise DispatchHalt("host observation mismatch: sandbox_policy")
-    if route.sandbox == "read-only" and policy != {"type": "read-only"}:
-        raise DispatchHalt("host observation mismatch: sandbox_policy")
-    if route.sandbox == "workspace-write":
-        allowed_keys = {
-            "type",
-            "network_access",
-            "exclude_slash_tmp",
-            "exclude_tmpdir_env_var",
-        }
-        if (
-            set(policy) != allowed_keys
-            or policy.get("type") != "workspace-write"
-            or policy.get("network_access") is not False
-            or not isinstance(policy.get("exclude_slash_tmp"), bool)
-            or not isinstance(policy.get("exclude_tmpdir_env_var"), bool)
-        ):
-            raise DispatchHalt("host observation mismatch: sandbox_policy")
-    return observed
-
-
-def ledger_append(home: Path, receipt: dict[str, Any]) -> str:
-    ledger_dir = home / "tier-routing"
-    ensure_private_dir(ledger_dir)
-    ledger = ledger_dir / "ledger.jsonl"
-    if ledger.is_symlink():
-        raise DispatchHalt("refusing symlinked local receipt ledger")
-    flags = os.O_RDWR | os.O_CREAT | os.O_APPEND | getattr(os, "O_NOFOLLOW", 0)
-    try:
-        descriptor = os.open(ledger, flags, 0o600)
-    except OSError as exc:
-        raise DispatchHalt(
-            f"unable to open local receipt ledger safely: {type(exc).__name__}"
-        ) from exc
-    with os.fdopen(descriptor, "a+", encoding="utf-8") as handle:
-        os.fchmod(handle.fileno(), 0o600)
-        reject_darwin_allow_acl(ledger, label="local receipt ledger")
-        fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
-        previous_hash = validate_ledger_lines(handle)
-        entry = {"previous_hash": previous_hash, "receipt": receipt}
-        entry_hash = sha256_bytes(canonical_json(entry))
-        entry["entry_hash"] = entry_hash
-        handle.seek(0, os.SEEK_END)
-        handle.write(json.dumps(entry, sort_keys=True) + "\n")
-        handle.flush()
-        os.fsync(handle.fileno())
-        fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
-    return f"local-ledger://{entry_hash}"
-
-
-def base_receipt(
-    route_name: str,
-    route: Route,
-    workdir: Path,
-    executable: str,
-) -> dict[str, Any]:
-    return {
-        "schema": SCHEMA,
-        "receipt_id": str(uuid.uuid4()),
-        "mechanism": "codex-exec-local",
-        "claim_class": "dispatcher_configured_and_host_observed",
-        "route_requested": route_name,
-        "route_resolved": route_name,
-        "requested": {
-            "model": route.model,
-            "effort": route.effort,
-            "sandbox": route.sandbox,
-            "approval_policy": "never",
-            "cwd": str(workdir),
-        },
-        "codex_executable": executable,
-        "codex_executable_sha256": sha256_file(Path(executable)),
-        "observed": None,
-        "status": "halt",
-        "started_at": utc_now(),
-        "finished_at": None,
-        "output_sha256": None,
-        "rollout_sha256": None,
-        "error": None,
-    }
-
-
-def reap_process_group(process: subprocess.Popen[str]) -> None:
-    """Tear down a child group without swallowing a second control-flow exit."""
-    try:
-        os.killpg(process.pid, signal.SIGKILL)
-    except OSError:
-        pass
-    for stream in (process.stdin, process.stdout, process.stderr):
-        if stream is not None:
-            try:
-                stream.close()
-            except Exception:
-                pass
-    try:
-        process.wait(timeout=5)
-    except (OSError, subprocess.TimeoutExpired):
-        pass
-
-
-def run_codex(
-    command: list[str], prompt: str, timeout: int, workdir: Path, home: Path
-) -> subprocess.CompletedProcess[str]:
-    process = None
-    try:
-        process = subprocess.Popen(
-            command,
-            cwd=workdir,
-            stdin=subprocess.PIPE,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            text=True,
-            encoding="utf-8",
-            env=child_environment(home),
-            start_new_session=True,
-        )
-        try:
-            stdout, stderr = process.communicate(input=prompt, timeout=timeout)
-        except subprocess.TimeoutExpired as exc:
-            reap_process_group(process)
-            raise DispatchHalt(
-                "codex exec timed out; completion state is ambiguous"
-            ) from exc
-        except Exception as exc:
-            reap_process_group(process)
-            raise DispatchHalt(f"codex exec failed: {type(exc).__name__}") from exc
-        except BaseException:
-            reap_process_group(process)
-            raise
-    except DispatchHalt:
-        raise
-    except Exception as exc:
-        if process is not None:
-            reap_process_group(process)
-        raise DispatchHalt(f"codex exec failed: {type(exc).__name__}") from exc
-    return subprocess.CompletedProcess(command, process.returncode, stdout, stderr)
-
-
-def dispatch(args: argparse.Namespace, home: Path | None = None) -> int:
-    home = resolve_codex_home() if home is None else home
-    route = ROUTES[args.route]
-    workdir = Path(args.workdir).expanduser().resolve()
-    if not workdir.is_dir():
-        raise DispatchHalt("workdir must be an existing directory")
-    prompt = read_prompt(args)
-    if home == workdir or home.is_relative_to(workdir) or workdir.is_relative_to(home):
-        raise DispatchHalt("workdir and Codex home must not contain one another")
-    executable = resolve_codex()
-    if native_multi_agent_enabled(executable, home, cwd=workdir):
-        raise DispatchHalt(
-            "native multi-agent spawning is enabled; run codex-tier strict-enable and restart Codex"
-        )
-    if native_multi_agent_enabled(executable, home, cwd=workdir, force_disabled=True):
-        raise DispatchHalt(
-            "Codex did not honor the child native multi-agent disable override"
-        )
-    preflight_ledger(home)
-    receipt = base_receipt(args.route, route, workdir, executable)
-    output = ""
-    try:
-        with Slot(home):
-            dispatch_started_ns = time.time_ns()
-            command = [
-                executable,
-                "-a",
-                "never",
-                "exec",
-                "--json",
-                "-m",
-                route.model,
-                "-c",
-                f'model_reasoning_effort="{route.effort}"',
-                "-c",
-                'approval_policy="never"',
-                "-c",
-                "features.multi_agent=false",
-                "-s",
-                route.sandbox,
-                "-C",
-                str(workdir),
-                "-",
-            ]
-            result = run_codex(command, prompt, args.timeout, workdir, home)
-            if sha256_file(Path(executable)) != receipt["codex_executable_sha256"]:
-                raise DispatchHalt("codex executable changed during dispatch")
-            if result.returncode != 0:
-                raise DispatchHalt(f"codex exec exited nonzero ({result.returncode})")
-            thread_id, output = parse_exec_stream(result.stdout)
-            rollout_path = find_rollout(home, thread_id, dispatch_started_ns)
-            observation, rollout_raw = load_observation(rollout_path)
-            receipt["observed"] = verify_observation(
-                observation,
-                thread_id=thread_id,
-                route=route,
-                workdir=workdir,
-            )
-            receipt["status"] = "pass"
-            receipt["output_sha256"] = sha256_bytes(output.encode())
-            receipt["rollout_sha256"] = sha256_bytes(rollout_raw)
-    except DispatchHalt as exc:
-        receipt["error"] = str(exc)
-    receipt["finished_at"] = utc_now()
-    receipt_ref = ledger_append(home, receipt)
-    envelope = {
-        "receipt": receipt,
-        "receipt_ref": receipt_ref,
-        "result": output if receipt["status"] == "pass" else None,
-    }
-    print(json.dumps(envelope, sort_keys=True))
-    return 0 if receipt["status"] == "pass" else 2
-
-
-def probe(_: argparse.Namespace, home: Path | None = None) -> int:
-    try:
-        home = resolve_codex_home() if home is None else home
-        executable = resolve_codex()
-        native_enabled = native_multi_agent_enabled(executable, home)
-        payload = {
-            "status": "halt" if native_enabled else "ready",
-            "schema": SCHEMA,
-            "codex_executable": executable,
-            "codex_version": codex_version(executable, home),
-            "codex_home": str(home),
-            "native_multi_agent_enabled": native_enabled,
-            "routes": {
-                name: {
-                    "model": value.model,
-                    "effort": value.effort,
-                    "sandbox": value.sandbox,
-                }
-                for name, value in ROUTES.items()
-            },
-        }
-        if native_enabled:
-            payload["error"] = (
-                "native multi-agent spawning is enabled; run codex-tier strict-enable and restart Codex"
-            )
-        print(json.dumps(payload, sort_keys=True))
-        return 2 if native_enabled else 0
-    except DispatchHalt as exc:
-        print(json.dumps({"status": "halt", "error": str(exc)}, sort_keys=True))
-        return 2
-    except Exception as exc:
-        print(
-            json.dumps(
-                {
-                    "status": "halt",
-                    "error": f"unexpected dispatcher failure: {type(exc).__name__}",
-                },
-                sort_keys=True,
-            )
-        )
-        return 2
-
-
-def parser() -> argparse.ArgumentParser:
-    result = argparse.ArgumentParser(prog="codex-tier")
-    subparsers = result.add_subparsers(dest="command", required=True)
-    probe_parser = subparsers.add_parser(
-        "probe", help="inspect local capability without a model call"
-    )
-    probe_parser.set_defaults(func=probe)
-
-    strict_enable_parser = subparsers.add_parser(
-        "strict-enable", help="disable native Codex subagent spawning in user config"
-    )
-    strict_enable_parser.set_defaults(func=strict_enable)
-
-    strict_disable_parser = subparsers.add_parser(
-        "strict-disable", help="restore config managed by strict-enable when unchanged"
-    )
-    strict_disable_parser.set_defaults(func=strict_disable)
-
-    dispatch_parser = subparsers.add_parser(
-        "dispatch", help="run one host-observed local route"
-    )
-    dispatch_parser.add_argument("--route", required=True, choices=sorted(ROUTES))
-    dispatch_parser.add_argument("--workdir", required=True)
-    dispatch_parser.add_argument(
-        "--prompt-file", help="read the task from a regular file; defaults to stdin"
-    )
-    dispatch_parser.add_argument("--timeout", type=int, default=DEFAULT_TIMEOUT_SECONDS)
-    dispatch_parser.set_defaults(func=dispatch)
-    return result
-
-
-def _validate_interpreter() -> None:
-    """Validate the resolved Python interpreter's write safety.
-
-    Checks the interpreter binary and its immediate parent directory for
-    unsafe write permissions. Foreign ownership is not rejected because
-    Python installations (Homebrew, pyenv, system package managers) are
-    commonly owned by root or an admin user distinct from the invoking user.
-    """
-    resolved = Path(sys.executable).resolve()
-    if not resolved.is_absolute():
-        raise DispatchHalt("Python interpreter must resolve to an absolute path")
-    for path in (resolved, resolved.parent):
-        try:
-            status = path.lstat()
-        except OSError as exc:
-            raise DispatchHalt(f"Python interpreter path is missing: {path}") from exc
-        mode = stat.S_IMODE(status.st_mode)
-        if mode & 0o022:
-            raise DispatchHalt(f"refusing writable Python interpreter path: {path}")
-
-
-def main() -> int:
-    # Validate the running interpreter's resolved chain before any dispatch
-    # work. The /bin/sh launcher resolves a Python 3.11+ interpreter, but it
-    # searches the caller's PATH. This check ensures the resolved interpreter
-    # is owned by root or the current user and has no writable ancestors.
-    # Symlinks in the caller path are resolved before validation because
-    # Homebrew and pyenv commonly use symlinks to versioned binaries.
-    _validate_interpreter()
-    args = parser().parse_args()
-    try:
-        home = resolve_codex_home()
-        if getattr(args, "timeout", 1) <= 0:
-            print(json.dumps({"status": "halt", "error": "timeout must be positive"}))
-            return 2
-        return args.func(args, home)
-    except DispatchHalt as exc:
-        print(json.dumps({"status": "halt", "error": str(exc)}, sort_keys=True))
-        return 2
-    except Exception as exc:
-        print(
-            json.dumps(
-                {
-                    "status": "halt",
-                    "error": f"unexpected dispatcher failure: {type(exc).__name__}",
-                },
-                sort_keys=True,
-            )
-        )
-        return 2
-
-
-if __name__ == "__main__":
-    raise SystemExit(main())
+[ -n "$PYTHON_BIN" ] || error "Python 3.11 or newer is unavailable"
+PATH=${ORIGINAL_PATH:-$SAFE_PATH}
+export PATH
+exec "$PYTHON_BIN" -I "$runtime_path" "$@"

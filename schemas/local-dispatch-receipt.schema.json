@@ -11,9 +11,23 @@
     "claim_class",
     "route_requested",
     "route_resolved",
+    "policy_kind",
+    "policy_id",
+    "policy_sha256",
+    "policy_input_sha256",
+    "policy_document",
     "requested",
+    "dispatcher_launcher",
+    "dispatcher_launcher_sha256",
+    "dispatcher_runtime",
+    "dispatcher_runtime_sha256",
+    "dispatcher_python",
+    "dispatcher_python_sha256",
     "codex_executable",
     "codex_executable_sha256",
+    "codex_runtime",
+    "codex_runtime_sha256",
+    "codex_launch_method",
     "observed",
     "status",
     "started_at",
@@ -23,15 +37,29 @@
     "error"
   ],
   "properties": {
-    "schema": {"const": "codex-tier-routing/local-dispatch-receipt/v1"},
+    "schema": {"const": "codex-tier-routing/local-dispatch-receipt/v2"},
     "receipt_id": {"type": "string", "format": "uuid", "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$"},
     "mechanism": {"const": "codex-exec-local"},
     "claim_class": {"const": "dispatcher_configured_and_host_observed"},
     "route_requested": {"enum": ["scout", "grunt", "builder", "reviewer", "architect"]},
     "route_resolved": {"enum": ["scout", "grunt", "builder", "reviewer", "architect"]},
+    "policy_kind": {"enum": ["builtin", "custom"]},
+    "policy_id": {"type": "string", "pattern": "^[a-z0-9][a-z0-9._-]{0,63}$"},
+    "policy_sha256": {"$ref": "#/$defs/sha256"},
+    "policy_input_sha256": {"$ref": "#/$defs/sha256"},
+    "policy_document": {"$ref": "#/$defs/policyDocument"},
     "requested": {"$ref": "#/$defs/routeObservation"},
+    "dispatcher_launcher": {"type": "string", "minLength": 1},
+    "dispatcher_launcher_sha256": {"$ref": "#/$defs/sha256"},
+    "dispatcher_runtime": {"type": "string", "minLength": 1},
+    "dispatcher_runtime_sha256": {"$ref": "#/$defs/sha256"},
+    "dispatcher_python": {"type": "string", "minLength": 1},
+    "dispatcher_python_sha256": {"$ref": "#/$defs/sha256"},
     "codex_executable": {"type": "string", "minLength": 1},
     "codex_executable_sha256": {"$ref": "#/$defs/sha256"},
+    "codex_runtime": {"type": "string", "minLength": 1},
+    "codex_runtime_sha256": {"$ref": "#/$defs/sha256"},
+    "codex_launch_method": {"enum": ["native", "explicit-shebang-runtime"]},
     "observed": {
       "oneOf": [
         {"$ref": "#/$defs/hostObservation"},
@@ -45,9 +73,59 @@
     "rollout_sha256": {"oneOf": [{"$ref": "#/$defs/sha256"}, {"type": "null"}]},
     "error": {"type": ["string", "null"]}
   },
+  "oneOf": [
+    {
+      "properties": {
+        "route_requested": {"const": "scout"},
+        "route_resolved": {"const": "scout"},
+        "requested": {"properties": {"sandbox": {"const": "read-only"}}},
+        "observed": {"properties": {"sandbox": {"const": "read-only"}}}
+      }
+    },
+    {
+      "properties": {
+        "route_requested": {"const": "grunt"},
+        "route_resolved": {"const": "grunt"},
+        "requested": {"properties": {"sandbox": {"const": "workspace-write"}}},
+        "observed": {"properties": {"sandbox": {"const": "workspace-write"}}}
+      }
+    },
+    {
+      "properties": {
+        "route_requested": {"const": "builder"},
+        "route_resolved": {"const": "builder"},
+        "requested": {"properties": {"sandbox": {"const": "workspace-write"}}},
+        "observed": {"properties": {"sandbox": {"const": "workspace-write"}}}
+      }
+    },
+    {
+      "properties": {
+        "route_requested": {"const": "reviewer"},
+        "route_resolved": {"const": "reviewer"},
+        "requested": {"properties": {"sandbox": {"const": "read-only"}}},
+        "observed": {"properties": {"sandbox": {"const": "read-only"}}}
+      }
+    },
+    {
+      "properties": {
+        "route_requested": {"const": "architect"},
+        "route_resolved": {"const": "architect"},
+        "requested": {"properties": {"sandbox": {"const": "read-only"}}},
+        "observed": {"properties": {"sandbox": {"const": "read-only"}}}
+      }
+    }
+  ],
   "allOf": [
     {
-      "if": {"properties": {"status": {"const": "pass"}}},
+      "if": {"required": ["policy_kind"], "properties": {"policy_kind": {"const": "builtin"}}},
+      "then": {"properties": {"policy_id": {"const": "default-v1"}}}
+    },
+    {
+      "if": {"required": ["policy_kind"], "properties": {"policy_kind": {"const": "custom"}}},
+      "then": {"properties": {"policy_id": {"const": "custom-v1"}}}
+    },
+    {
+      "if": {"required": ["status"], "properties": {"status": {"const": "pass"}}},
       "then": {
         "properties": {
           "observed": {"$ref": "#/$defs/hostObservation"},
@@ -58,7 +136,7 @@
       }
     },
     {
-      "if": {"properties": {"status": {"const": "halt"}}},
+      "if": {"required": ["status"], "properties": {"status": {"const": "halt"}}},
       "then": {
         "properties": {
           "output_sha256": {"type": "null"},
@@ -70,13 +148,56 @@
   ],
   "$defs": {
     "sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+    "policyRouteReadOnly": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["model", "effort", "sandbox", "approval_policy"],
+      "properties": {
+        "model": {"type": "string", "pattern": "^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$"},
+        "effort": {"enum": ["none", "low", "medium", "high", "xhigh", "max"]},
+        "sandbox": {"const": "read-only"},
+        "approval_policy": {"const": "never"}
+      }
+    },
+    "policyRouteWorkspaceWrite": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["model", "effort", "sandbox", "approval_policy"],
+      "properties": {
+        "model": {"type": "string", "pattern": "^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$"},
+        "effort": {"enum": ["none", "low", "medium", "high", "xhigh", "max"]},
+        "sandbox": {"const": "workspace-write"},
+        "approval_policy": {"const": "never"}
+      }
+    },
+    "policyDocument": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["schema", "policy_id", "routes"],
+      "properties": {
+        "schema": {"const": "codex-tier-routing/policy/v1"},
+        "policy_id": {"type": "string", "pattern": "^[a-z0-9][a-z0-9._-]{0,63}$"},
+        "routes": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["scout", "grunt", "builder", "reviewer", "architect"],
+          "properties": {
+            "scout": {"$ref": "#/$defs/policyRouteReadOnly"},
+            "grunt": {"$ref": "#/$defs/policyRouteWorkspaceWrite"},
+            "builder": {"$ref": "#/$defs/policyRouteWorkspaceWrite"},
+            "reviewer": {"$ref": "#/$defs/policyRouteReadOnly"},
+            "architect": {"$ref": "#/$defs/policyRouteReadOnly"}
+          }
+        }
+      }
+    },
     "routeObservation": {
       "type": "object",
       "additionalProperties": false,
       "required": ["model", "effort", "sandbox", "approval_policy", "cwd"],
       "properties": {
-        "model": {"type": "string", "minLength": 1},
-        "effort": {"type": "string", "minLength": 1},
+        "model": {"type": "string", "pattern": "^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$"},
+        "effort": {"enum": ["none", "low", "medium", "high", "xhigh", "max"]},
         "sandbox": {"enum": ["read-only", "workspace-write"]},
         "approval_policy": {"const": "never"},
         "cwd": {"type": "string", "minLength": 1}
@@ -92,10 +213,10 @@
       "properties": {
         "session_id": {"type": "string", "minLength": 1},
         "source": {"const": "exec"},
-        "originator": {"type": ["string", "null"]},
-        "model_provider": {"type": ["string", "null"]},
-        "model": {"type": "string", "minLength": 1},
-        "effort": {"type": "string", "minLength": 1},
+        "originator": {"const": "codex_exec"},
+        "model_provider": {"const": "openai"},
+        "model": {"type": "string", "pattern": "^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$"},
+        "effort": {"enum": ["none", "low", "medium", "high", "xhigh", "max"]},
         "sandbox": {"enum": ["read-only", "workspace-write"]},
         "sandbox_policy": {
           "oneOf": [
@@ -108,9 +229,10 @@
             {
               "type": "object",
               "additionalProperties": false,
-              "required": ["type", "network_access", "exclude_slash_tmp", "exclude_tmpdir_env_var"],
+              "required": ["type", "writable_roots", "network_access", "exclude_slash_tmp", "exclude_tmpdir_env_var"],
               "properties": {
                 "type": {"const": "workspace-write"},
+                "writable_roots": {"type": "array", "maxItems": 0},
                 "network_access": {"const": false},
                 "exclude_slash_tmp": {"type": "boolean"},
                 "exclude_tmpdir_env_var": {"type": "boolean"}
@@ -125,7 +247,7 @@
       },
       "allOf": [
         {
-          "if": {"properties": {"sandbox": {"const": "read-only"}}},
+          "if": {"required": ["sandbox"], "properties": {"sandbox": {"const": "read-only"}}},
           "then": {
             "properties": {
               "sandbox_policy": {
@@ -138,15 +260,16 @@
           }
         },
         {
-          "if": {"properties": {"sandbox": {"const": "workspace-write"}}},
+          "if": {"required": ["sandbox"], "properties": {"sandbox": {"const": "workspace-write"}}},
           "then": {
             "properties": {
               "sandbox_policy": {
                 "type": "object",
                 "additionalProperties": false,
-                "required": ["type", "network_access", "exclude_slash_tmp", "exclude_tmpdir_env_var"],
+                "required": ["type", "writable_roots", "network_access", "exclude_slash_tmp", "exclude_tmpdir_env_var"],
                 "properties": {
                   "type": {"const": "workspace-write"},
+                  "writable_roots": {"type": "array", "maxItems": 0},
                   "network_access": {"const": false},
                   "exclude_slash_tmp": {"type": "boolean"},
                   "exclude_tmpdir_env_var": {"type": "boolean"}

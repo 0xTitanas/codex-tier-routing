@@ -1,0 +1,71 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1600" height="720" viewBox="0 0 1600 720" role="img" aria-labelledby="title description">
+  <title id="title">Codex Tier Routing</title>
+  <desc id="description">A neutral diagram showing one task routed through stable Scout, Grunt, Builder, Reviewer, and Architect roles into verified local receipts.</desc>
+  <defs>
+    <linearGradient id="background" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#071426"/>
+      <stop offset="1" stop-color="#102b45"/>
+    </linearGradient>
+    <linearGradient id="accent" x1="0" y1="0" x2="1" y2="0">
+      <stop offset="0" stop-color="#53d6c7"/>
+      <stop offset="1" stop-color="#74a7ff"/>
+    </linearGradient>
+    <filter id="shadow" x="-20%" y="-20%" width="140%" height="140%">
+      <feDropShadow dx="0" dy="10" stdDeviation="16" flood-color="#020817" flood-opacity="0.45"/>
+    </filter>
+  </defs>
+  <rect width="1600" height="720" rx="32" fill="url(#background)"/>
+  <g opacity="0.14" stroke="#8fb8df" fill="none">
+    <path d="M0 120H1600M0 240H1600M0 360H1600M0 480H1600M0 600H1600"/>
+    <path d="M200 0V720M400 0V720M600 0V720M800 0V720M1000 0V720M1200 0V720M1400 0V720"/>
+  </g>
+  <text x="104" y="126" fill="#f4f8fc" font-family="ui-sans-serif, system-ui, sans-serif" font-size="64" font-weight="720">Codex Tier Routing</text>
+  <text x="108" y="178" fill="#aec4d8" font-family="ui-sans-serif, system-ui, sans-serif" font-size="25">Stable routes · configurable model maps · host-observed receipts</text>
+
+  <g filter="url(#shadow)">
+    <rect x="108" y="268" width="250" height="132" rx="22" fill="#132f48" stroke="#4b7497"/>
+    <text x="233" y="320" text-anchor="middle" fill="#eff8ff" font-family="ui-sans-serif, system-ui, sans-serif" font-size="30" font-weight="700">Task</text>
+    <text x="233" y="361" text-anchor="middle" fill="#aac1d4" font-family="ui-monospace, monospace" font-size="18">classify locally</text>
+
+    <rect x="474" y="232" width="660" height="204" rx="26" fill="#0e253b" stroke="url(#accent)" stroke-width="2"/>
+    <text x="804" y="278" text-anchor="middle" fill="#dcebf7" font-family="ui-sans-serif, system-ui, sans-serif" font-size="22" font-weight="650">STABLE ROUTES</text>
+    <g font-family="ui-sans-serif, system-ui, sans-serif" text-anchor="middle">
+      <rect x="506" y="310" width="104" height="82" rx="16" fill="#173a52"/>
+      <text x="558" y="344" fill="#75e0d1" font-size="19" font-weight="700">Scout</text>
+      <text x="558" y="373" fill="#aac1d4" font-size="13">read-only</text>
+      <rect x="620" y="310" width="104" height="82" rx="16" fill="#173a52"/>
+      <text x="672" y="344" fill="#75e0d1" font-size="19" font-weight="700">Grunt</text>
+      <text x="672" y="373" fill="#aac1d4" font-size="13">workspace</text>
+      <rect x="734" y="310" width="104" height="82" rx="16" fill="#173a52"/>
+      <text x="786" y="344" fill="#75e0d1" font-size="19" font-weight="700">Builder</text>
+      <text x="786" y="373" fill="#aac1d4" font-size="13">workspace</text>
+      <rect x="848" y="310" width="104" height="82" rx="16" fill="#173a52"/>
+      <text x="900" y="344" fill="#8db5ff" font-size="18" font-weight="700">Reviewer</text>
+      <text x="900" y="373" fill="#aac1d4" font-size="13">read-only</text>
+      <rect x="962" y="310" width="104" height="82" rx="16" fill="#173a52"/>
+      <text x="1014" y="344" fill="#8db5ff" font-size="17" font-weight="700">Architect</text>
+      <text x="1014" y="373" fill="#aac1d4" font-size="13">read-only</text>
+    </g>
+
+    <rect x="1250" y="268" width="250" height="132" rx="22" fill="#132f48" stroke="#4b7497"/>
+    <text x="1375" y="320" text-anchor="middle" fill="#eff8ff" font-family="ui-sans-serif, system-ui, sans-serif" font-size="30" font-weight="700">Receipt</text>
+    <text x="1375" y="361" text-anchor="middle" fill="#aac1d4" font-family="ui-monospace, monospace" font-size="18">verify, then trust</text>
+  </g>
+
+  <g stroke="url(#accent)" stroke-width="6" fill="none" stroke-linecap="round" stroke-linejoin="round">
+    <path d="M376 334H450"/>
+    <path d="M432 318L450 334L432 350"/>
+    <path d="M1158 334H1232"/>
+    <path d="M1214 318L1232 334L1214 350"/>
+  </g>
+
+  <g font-family="ui-monospace, monospace" font-size="18">
+    <rect x="270" y="510" width="1060" height="92" rx="20" fill="#081b2d" stroke="#294d69"/>
+    <circle cx="320" cy="556" r="13" fill="#53d6c7"/>
+    <text x="350" y="563" fill="#c8d9e6">requested policy</text>
+    <circle cx="650" cy="556" r="13" fill="#74a7ff"/>
+    <text x="680" y="563" fill="#c8d9e6">host observation</text>
+    <circle cx="1008" cy="556" r="13" fill="#f5c96b"/>
+    <text x="1038" y="563" fill="#c8d9e6">untrusted result</text>
+  </g>
+</svg>

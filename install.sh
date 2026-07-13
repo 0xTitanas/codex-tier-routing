@@ -24,12 +24,6 @@ SAFE_PATH=$(command -p getconf PATH 2>/dev/null || printf '/usr/bin:/bin:/usr/sb
 PATH=$SAFE_PATH
 export PATH
 
-RM_BIN=$(command -v rm 2>/dev/null || printf '')
-case "$RM_BIN" in
-  /*) ;;
-  *) error "Unable to locate the system rm utility" ;;
-esac
-
 usage() {
   cat <<'EOF'
 Usage: ./install.sh [--dry-run] [--strict] [--codex-home PATH]
@@ -51,6 +45,12 @@ error() {
   printf '%s\n' "$1" >&2
   exit 1
 }
+
+RM_BIN=$(command -v rm 2>/dev/null || printf '')
+case "$RM_BIN" in
+  /*) ;;
+  *) error "Unable to locate the system rm utility" ;;
+esac
 
 DRY_RUN=0
 STRICT=0
@@ -107,9 +107,11 @@ esac
 AGENTS_SRC="$REPO_ROOT/agents"
 SKILL_SRC="$REPO_ROOT/skills/model-routing"
 DISPATCHER_SRC="$REPO_ROOT/bin/codex-tier"
+DISPATCHER_RUNTIME_SRC="$REPO_ROOT/bin/codex-tier.py"
 AGENTS_DST="$CODEX_HOME/agents"
 SKILL_DST="$CODEX_HOME/skills/model-routing"
 DISPATCHER_DST="$CODEX_HOME/bin/codex-tier"
+DISPATCHER_RUNTIME_DST="$CODEX_HOME/bin/codex-tier.py"
 
 if [ "$DRY_RUN" -eq 1 ]; then
   echo "Dry run enabled: no filesystem changes will be made."
@@ -231,9 +233,14 @@ validate_chain_components() {
       chain_without_other=${chain_mode%?}
       chain_group=${chain_without_other#${chain_without_other%?}}
       chain_other=${chain_mode#${chain_mode%?}}
-      case "$chain_group:$chain_other" in
-        [2367]:*|*:[2367]) error "Refusing writable $chain_label component: $chain_current" ;;
+      case "$chain_other" in
+        [2367]) error "Refusing world-writable $chain_label component: $chain_current" ;;
       esac
+      if [ "$chain_uid" != "$effective_uid" ]; then
+        case "$chain_group" in
+          [2367]) error "Refusing group-writable foreign $chain_label component: $chain_current" ;;
+        esac
+      fi
       validate_darwin_acl "$chain_current"
     fi
     [ "$chain_component" = "$chain_rest" ] && break
@@ -272,7 +279,7 @@ run_python() {
 }
 
 run_dispatcher() {
-  run_python "$DISPATCHER_DST" "$@"
+  run_python "$DISPATCHER_RUNTIME_DST" "$@"
 }
 
 validate_runtime_path() {
@@ -293,27 +300,33 @@ validate_runtime_path() {
   else
     validate_trusted_chain "$ENV_BIN" "env executable path" >/dev/null
     [ -n "$ORIGINAL_PATH" ] || error "Runtime PATH is empty"
-    runtime_rest=$ORIGINAL_PATH
-    while :; do
-      runtime_entry=${runtime_rest%%:*}
-      [ -n "$runtime_entry" ] || error "Runtime PATH contains an empty component"
-      case "$runtime_entry" in
+    PYTHON_BIN=${CODEX_TIER_PYTHON_BIN:-}
+    if [ -n "$PYTHON_BIN" ]; then
+      case "$PYTHON_BIN" in
         /*) ;;
-        *) error "Runtime PATH contains a relative component: $runtime_entry" ;;
+        *) error "CODEX_TIER_PYTHON_BIN must be absolute" ;;
       esac
-      runtime_resolved=$(validate_trusted_chain "$runtime_entry" "runtime PATH")
-      [ -d "$runtime_resolved" ] && [ -x "$runtime_resolved" ] || error "Runtime PATH component is not an executable directory: $runtime_entry"
-      [ "$runtime_entry" = "$runtime_rest" ] && break
-      runtime_rest=${runtime_rest#*:}
-    done
-
-    PYTHON_BIN=$(PATH="$ORIGINAL_PATH" command -v python3 2>/dev/null || printf '')
-    case "$PYTHON_BIN" in
-      /*) ;;
-      *) error "Python 3 is unavailable from the validated runtime PATH" ;;
-    esac
-    PYTHON_BIN=$(validate_trusted_chain "$PYTHON_BIN" "Python 3 executable path")
-    [ -f "$PYTHON_BIN" ] && [ -x "$PYTHON_BIN" ] || error "Python 3 is not an executable regular file: $PYTHON_BIN"
+      PYTHON_BIN=$(validate_trusted_chain "$PYTHON_BIN" "Python 3 executable path")
+      [ -f "$PYTHON_BIN" ] && [ -x "$PYTHON_BIN" ] || error "Python 3 is not an executable regular file: $PYTHON_BIN"
+      run_python -c 'import sys; raise SystemExit(0 if sys.version_info >= (3, 11) else 1)' || error "CODEX_TIER_PYTHON_BIN must be Python 3.11 or newer"
+    else
+      for python_name in python3.11 python3.12 python3.13 python3.14 python3.15 python3; do
+        python_candidate=$(PATH="$ORIGINAL_PATH" command -v "$python_name" 2>/dev/null || printf '')
+        [ -n "$python_candidate" ] || continue
+        case "$python_candidate" in
+          /*) ;;
+          *) continue ;;
+        esac
+        python_candidate=$(validate_trusted_chain "$python_candidate" "Python 3 executable path")
+        [ -f "$python_candidate" ] && [ -x "$python_candidate" ] || error "Python 3 is not an executable regular file: $python_candidate"
+        PYTHON_BIN=$python_candidate
+        if run_python -c 'import sys; raise SystemExit(0 if sys.version_info >= (3, 11) else 1)'; then
+          break
+        fi
+        PYTHON_BIN=
+      done
+      [ -n "$PYTHON_BIN" ] || error "Python 3.11 or newer is unavailable from PATH"
+    fi
   fi
 
   run_python -c 'import sys; raise SystemExit(0 if sys.version_info >= (3, 11) else 1)' || error "Python 3.11 or newer is required"
@@ -530,7 +543,10 @@ if [ ! -d "$SKILL_SRC" ]; then
   error "Skill directory not found: $SKILL_SRC"
 fi
 if [ ! -f "$DISPATCHER_SRC" ]; then
-  error "Dispatcher not found: $DISPATCHER_SRC"
+  error "Dispatcher launcher not found: $DISPATCHER_SRC"
+fi
+if [ ! -f "$DISPATCHER_RUNTIME_SRC" ]; then
+  error "Dispatcher Python runtime not found: $DISPATCHER_RUNTIME_SRC"
 fi
 
 # Preflight the complete source and existing destination boundaries before
@@ -543,8 +559,10 @@ for agent_toml in "$AGENTS_SRC"/*.toml; do
   [ -r "$agent_toml" ] || error "Agent source is not readable: $agent_toml"
 done
 [ -f "$SKILL_SRC/SKILL.md" ] || error "Skill entrypoint not found: $SKILL_SRC/SKILL.md"
-[ -r "$DISPATCHER_SRC" ] || error "Dispatcher source is not readable: $DISPATCHER_SRC"
-[ -x "$DISPATCHER_SRC" ] || error "Dispatcher source is not executable: $DISPATCHER_SRC"
+[ -r "$DISPATCHER_SRC" ] || error "Dispatcher launcher is not readable: $DISPATCHER_SRC"
+[ -x "$DISPATCHER_SRC" ] || error "Dispatcher launcher is not executable: $DISPATCHER_SRC"
+[ -r "$DISPATCHER_RUNTIME_SRC" ] || error "Dispatcher Python runtime is not readable: $DISPATCHER_RUNTIME_SRC"
+/bin/sh -n "$DISPATCHER_SRC" || error "Dispatcher launcher has invalid shell syntax: $DISPATCHER_SRC"
 unexpected_skill_source=$(find "$SKILL_SRC" \( -type l -o \( ! -type d ! -type f \) \) -print -quit)
 [ -z "$unexpected_skill_source" ] || error "Skill source tree contains a symlink or special node: $unexpected_skill_source"
 if ! find "$SKILL_SRC" -type f -exec sh -c '
@@ -573,6 +591,7 @@ for agent_toml in "$AGENTS_SRC"/*.toml; do
 done
 validate_safe_existing_object "$SKILL_DST" "replacement destination"
 validate_safe_existing_object "$DISPATCHER_DST" "replacement destination"
+validate_safe_existing_object "$DISPATCHER_RUNTIME_DST" "replacement destination"
 
 STAGE_ROOT=
 TRANSACTION_ROOT=
@@ -687,6 +706,7 @@ rollback_transaction() {
     STRICT_CHANGED=0
   fi
   restore_target "$DISPATCHER_DST" "bin/codex-tier" || rollback_status=1
+  restore_target "$DISPATCHER_RUNTIME_DST" "bin/codex-tier.py" || rollback_status=1
   restore_target "$SKILL_DST" "skills/model-routing" || rollback_status=1
   for restore_source in "$AGENTS_SRC"/*.toml; do
     restore_base=${restore_source##*/}
@@ -734,6 +754,7 @@ if [ "$DRY_RUN" -eq 1 ]; then
   done
   echo "Would install: $SKILL_SRC -> $SKILL_DST"
   echo "Would install: $DISPATCHER_SRC -> $DISPATCHER_DST"
+  echo "Would install: $DISPATCHER_RUNTIME_SRC -> $DISPATCHER_RUNTIME_DST"
   [ "$STRICT" -eq 0 ] || echo "Would enable strict routing in: $CODEX_HOME/config.toml"
   echo "Dry-run complete. No files were changed."
   exit 0
@@ -748,9 +769,11 @@ for source_path in "$AGENTS_SRC"/*.toml; do
 done
 cp -R "$SKILL_SRC" "$STAGE_ROOT/skills/model-routing" || error "Unable to stage skill source: $SKILL_SRC"
 cp "$DISPATCHER_SRC" "$STAGE_ROOT/bin/codex-tier" || error "Unable to stage dispatcher source: $DISPATCHER_SRC"
+cp "$DISPATCHER_RUNTIME_SRC" "$STAGE_ROOT/bin/codex-tier.py" || error "Unable to stage dispatcher Python runtime: $DISPATCHER_RUNTIME_SRC"
 chmod 700 "$STAGE_ROOT/agents" "$STAGE_ROOT/skills" "$STAGE_ROOT/bin"
 chmod 600 "$STAGE_ROOT/agents/"*.toml
 chmod 700 "$STAGE_ROOT/bin/codex-tier"
+chmod 600 "$STAGE_ROOT/bin/codex-tier.py"
 normalize_private_tree "$STAGE_ROOT/skills/model-routing"
 validate_private_tree "$STAGE_ROOT/skills/model-routing" "staged skill tree"
 for source_path in "$AGENTS_SRC"/*.toml; do
@@ -759,6 +782,7 @@ for source_path in "$AGENTS_SRC"/*.toml; do
 done
 diff -qr "$SKILL_SRC" "$STAGE_ROOT/skills/model-routing" >/dev/null || error "Staged skill verification failed: $SKILL_SRC"
 cmp -s "$DISPATCHER_SRC" "$STAGE_ROOT/bin/codex-tier" || error "Staged dispatcher verification failed: $DISPATCHER_SRC"
+cmp -s "$DISPATCHER_RUNTIME_SRC" "$STAGE_ROOT/bin/codex-tier.py" || error "Staged dispatcher Python verification failed: $DISPATCHER_RUNTIME_SRC"
 
 TRANSACTION_ROOT="$CODEX_HOME/.codex-tier-routing-transaction.$$"
 mkdir -m 700 "$TRANSACTION_ROOT"
@@ -820,11 +844,13 @@ for source_path in "$AGENTS_SRC"/*.toml; do
 done
 replace_dir "$STAGE_ROOT/skills/model-routing" "$SKILL_DST" "skills/model-routing"
 replace_file "$STAGE_ROOT/bin/codex-tier" "$DISPATCHER_DST" "bin/codex-tier"
+replace_file "$STAGE_ROOT/bin/codex-tier.py" "$DISPATCHER_RUNTIME_DST" "bin/codex-tier.py"
 for installed_agent in "$AGENTS_DST"/*.toml; do
   validate_private_object "$installed_agent" 600 "installed agent profile"
 done
 validate_private_tree "$SKILL_DST" "installed skill tree"
 validate_private_object "$DISPATCHER_DST" 700 "installed dispatcher"
+validate_private_object "$DISPATCHER_RUNTIME_DST" 600 "installed dispatcher Python runtime"
 if [ "$STRICT" -eq 1 ]; then
   [ -e "$CODEX_HOME/tier-routing" ] || TIER_ROUTING_CREATED=1
   if [ ! -e "$CODEX_HOME/tier-routing/strict-config.json" ] && [ ! -L "$CODEX_HOME/tier-routing/strict-config.json" ]; then
@@ -897,8 +923,8 @@ if [ "$STRICT" -eq 1 ]; then
   if [ "${CODEX_TIER_CODEX_BIN+x}" = x ]; then
     uninstall_codex_bin=" $(shell_quote "CODEX_TIER_CODEX_BIN=$CODEX_TIER_CODEX_BIN")"
   fi
-  uninstall_cmd="$(shell_quote "$ENV_BIN") -i $(shell_quote "HOME=$HOME") $(shell_quote "PATH=$ORIGINAL_PATH") $(shell_quote "CODEX_HOME=$CODEX_HOME")$uninstall_codex_bin $(shell_quote "$PYTHON_BIN") -I $(shell_quote "$DISPATCHER_DST") strict-disable && $(shell_quote "$RM_BIN") -f$INSTALL_FILES $(shell_quote "$DISPATCHER_DST") && $(shell_quote "$RM_BIN") -rf $(shell_quote "$SKILL_DST")"
+  uninstall_cmd="$(shell_quote "$ENV_BIN") -i $(shell_quote "HOME=$HOME") $(shell_quote "PATH=$ORIGINAL_PATH") $(shell_quote "CODEX_HOME=$CODEX_HOME")$uninstall_codex_bin $(shell_quote "$PYTHON_BIN") -I $(shell_quote "$DISPATCHER_RUNTIME_DST") strict-disable && $(shell_quote "$RM_BIN") -f$INSTALL_FILES $(shell_quote "$DISPATCHER_DST") $(shell_quote "$DISPATCHER_RUNTIME_DST") && $(shell_quote "$RM_BIN") -rf $(shell_quote "$SKILL_DST")"
 else
-  uninstall_cmd="$(shell_quote "$RM_BIN") -f$INSTALL_FILES $(shell_quote "$DISPATCHER_DST") && $(shell_quote "$RM_BIN") -rf $(shell_quote "$SKILL_DST")"
+  uninstall_cmd="$(shell_quote "$RM_BIN") -f$INSTALL_FILES $(shell_quote "$DISPATCHER_DST") $(shell_quote "$DISPATCHER_RUNTIME_DST") && $(shell_quote "$RM_BIN") -rf $(shell_quote "$SKILL_DST")"
 fi
 printf 'Exact uninstall command for installed files:\n%s\n' "$uninstall_cmd"

@@ -20,10 +20,13 @@ from pathlib import Path
 REQUIRED_SKILL_MARKERS = (
     "Check capability first",
     "Local dispatcher",
-    "codex-tier-routing/local-dispatch-receipt/v1",
+    "codex-tier-routing/local-dispatch-receipt/v2",
     "dispatcher_configured_and_host_observed",
     "Cap concurrent dispatches at four",
     "Do not automatically retry",
+    "policy-check",
+    "receipt-check",
+    "policy.toml",
 )
 
 REQUIRED_LOCAL_GUIDE_MARKERS = (
@@ -32,6 +35,9 @@ REQUIRED_LOCAL_GUIDE_MARKERS = (
     "four active",
     "no automatic retry",
     "provider-side",
+    "policy-check",
+    "receipt-check",
+    "policy.toml",
 )
 
 REQUIRED_PUBLIC_FILES = (
@@ -42,12 +48,30 @@ REQUIRED_PUBLIC_FILES = (
     "SECURITY.md",
     "CONTRIBUTING.md",
     "CHANGELOG.md",
+    "VERSION",
     "docs/compatibility.md",
     "docs/local-dispatcher.md",
+    "docs/releasing.md",
+    "docs/threat-model.md",
+    "policy.sample.toml",
     "schemas/local-dispatch-receipt.schema.json",
+    "schemas/local-dispatch-envelope.schema.json",
 )
 
-LOCAL_SCHEMA_SHA256 = "982c1e96a7f53cf4b9c157960f6af509206e52bbcfdb2b4ecf7ce560147776fb"
+LOCAL_SCHEMA_SHA256 = "bc332117e5d7bc3d3199159c507d9d43bf8c9bde487cbe912a89e173853a0c07"
+LOCAL_ENVELOPE_SCHEMA_SHA256 = (
+    "975f28062803a6bb9dcea8e794898c3f71321f2d235d5301faf6170901ea84fb"
+)
+
+PROHIBITED_PUBLIC_PATTERNS = (
+    ("private assistant codename", re.compile("ja" + "rvis", re.IGNORECASE)),
+    ("private orchestration product", re.compile("her" + "mes", re.IGNORECASE)),
+    ("private routing system", re.compile("needle" + "cast", re.IGNORECASE)),
+    ("private review service", re.compile("fa" + "ble", re.IGNORECASE)),
+    ("personal account name", re.compile("ab" + "jornson", re.IGNORECASE)),
+    ("personal given name", re.compile(r"\bAnd" + r"rew\b", re.IGNORECASE)),
+    ("private macOS path", re.compile("/" + "Users" + "/")),
+)
 
 
 def canonical_json_sha256(payload: object) -> str:
@@ -88,6 +112,171 @@ def check_readme_links(root: Path) -> int:
     return failures
 
 
+def check_public_privacy(root: Path) -> int:
+    failures = 0
+    excluded_parts = {".git", ".ruff_cache", "__pycache__"}
+    text_extensions = {
+        ".cff",
+        ".json",
+        ".md",
+        ".py",
+        ".sh",
+        ".svg",
+        ".toml",
+        ".txt",
+        ".yml",
+        ".yaml",
+    }
+    candidates = sorted(
+        path
+        for path in root.rglob("*")
+        if path.is_file()
+        and not any(part in excluded_parts for part in path.relative_to(root).parts)
+        and (
+            path.suffix.lower() in text_extensions
+            or path.name in {"LICENSE", "VERSION"}
+        )
+    )
+    for path in candidates:
+        try:
+            text = path.read_text(encoding="utf-8")
+        except (OSError, UnicodeError) as err:
+            failures += 1
+            print(f"[FAIL] {path.relative_to(root)}: text scan failed ({err})")
+            continue
+        for label, pattern in PROHIBITED_PUBLIC_PATTERNS:
+            if pattern.search(text):
+                failures += 1
+                print(f"[FAIL] {path.relative_to(root)}: contains {label}")
+    if failures == 0:
+        print(f"[PASS] public privacy scan: {len(candidates)} text file(s) checked")
+    return failures
+
+
+def check_default_policy_alignment(root: Path) -> int:
+    """Keep the sample, packaged profiles, and documented route boundary aligned."""
+    sample_path = root / "policy.sample.toml"
+    try:
+        sample = tomllib.loads(sample_path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeError, tomllib.TOMLDecodeError) as err:
+        print(f"[FAIL] policy.sample.toml: invalid ({err})")
+        return 1
+    expected_routes = {
+        "scout": "read-only",
+        "grunt": "workspace-write",
+        "builder": "workspace-write",
+        "reviewer": "read-only",
+        "architect": "read-only",
+    }
+    failures = 0
+    if set(sample) != {"schema", "routes"}:
+        failures += 1
+        print("[FAIL] policy.sample.toml: unexpected top-level fields")
+    if sample.get("schema") != "codex-tier-routing/policy/v1":
+        failures += 1
+        print("[FAIL] policy.sample.toml: unexpected schema")
+    routes = sample.get("routes")
+    if not isinstance(routes, dict) or set(routes) != set(expected_routes):
+        failures += 1
+        print("[FAIL] policy.sample.toml: route set does not match packaged roles")
+        return failures
+    for name, sandbox in expected_routes.items():
+        selection = routes[name]
+        if not isinstance(selection, dict) or set(selection) != {"model", "effort"}:
+            failures += 1
+            print(f"[FAIL] policy.sample.toml: invalid {name} fields")
+            continue
+        try:
+            profile = tomllib.loads(
+                (root / "agents" / f"{name}.toml").read_text(encoding="utf-8")
+            )
+        except (OSError, UnicodeError, tomllib.TOMLDecodeError) as err:
+            failures += 1
+            print(f"[FAIL] agents/{name}.toml: invalid ({err})")
+            continue
+        if (
+            profile.get("name") != name
+            or profile.get("model") != selection.get("model")
+            or profile.get("model_reasoning_effort") != selection.get("effort")
+            or profile.get("sandbox_mode") != sandbox
+        ):
+            failures += 1
+            print(f"[FAIL] agents/{name}.toml: default policy mismatch")
+    if failures == 0:
+        print("[PASS] sample policy matches all packaged profile defaults")
+    return failures
+
+
+def check_release_metadata(root: Path) -> int:
+    """Require every public version surface to agree with VERSION."""
+    failures = 0
+    try:
+        raw_version = (root / "VERSION").read_text(encoding="utf-8")
+    except OSError as err:
+        print(f"[FAIL] VERSION: unreadable ({err})")
+        return 1
+    version = raw_version.strip()
+    if (
+        raw_version != f"{version}\n"
+        or re.fullmatch(r"[0-9]+\.[0-9]+\.[0-9]+(?:-[0-9A-Za-z.-]+)?", version) is None
+    ):
+        print("[FAIL] VERSION: expected one canonical semantic version line")
+        return 1
+
+    try:
+        runtime = (root / "bin" / "codex-tier.py").read_text(encoding="utf-8")
+        readme = (root / "README.md").read_text(encoding="utf-8")
+        changelog = (root / "CHANGELOG.md").read_text(encoding="utf-8")
+        citation = (root / "CITATION.cff").read_text(encoding="utf-8")
+        security = (root / "SECURITY.md").read_text(encoding="utf-8")
+        releasing = (root / "docs" / "releasing.md").read_text(encoding="utf-8")
+    except OSError as err:
+        print(f"[FAIL] release metadata: unreadable ({err})")
+        return 1
+
+    changelog_match = re.search(
+        rf"^## \[{re.escape(version)}\] - ([0-9]{{4}}-[0-9]{{2}}-[0-9]{{2}})$",
+        changelog,
+        re.MULTILINE,
+    )
+    release_date = changelog_match.group(1) if changelog_match else None
+    checks = (
+        (f'PROJECT_VERSION = "{version}"', runtime, "dispatcher runtime"),
+        (f"`v{version}`", readme, "README release"),
+        (f"version: {version}", citation, "citation version"),
+        (f"date-released: {release_date}", citation, "citation release date"),
+        (f"`v{version}`", security, "security support line"),
+        (f"`v{version}`", releasing, "release procedure"),
+    )
+    if release_date is None:
+        failures += 1
+        print("[FAIL] CHANGELOG.md: missing dated VERSION release heading")
+    for marker, text, label in checks:
+        if marker not in text:
+            failures += 1
+            print(f"[FAIL] {label}: missing {marker!r}")
+    if failures == 0:
+        print(f"[PASS] release metadata agrees on v{version} ({release_date})")
+    return failures
+
+
+def check_command(root: Path, command: list[str], label: str) -> int:
+    result = subprocess.run(
+        command,
+        cwd=root,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        check=False,
+    )
+    if result.returncode:
+        detail = result.stderr.strip() or result.stdout.strip()
+        print(f"[FAIL] {label}: {detail}")
+        return 1
+    print(f"[PASS] {label}")
+    return 0
+
+
 def main() -> int:
     root = Path(__file__).resolve().parent.parent
     failures = 0
@@ -111,24 +300,44 @@ def main() -> int:
         root,
     )
 
-    schema_path = root / "schemas" / "local-dispatch-receipt.schema.json"
-    try:
-        schema = json.loads(schema_path.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError) as err:
-        failures += 1
-        print(f"[FAIL] {schema_path.relative_to(root)}: unreadable ({err})")
-    else:
-        observed = canonical_json_sha256(schema)
-        if observed != LOCAL_SCHEMA_SHA256:
+    for relative, expected_hash, label in (
+        (
+            "schemas/local-dispatch-receipt.schema.json",
+            LOCAL_SCHEMA_SHA256,
+            "local receipt schema",
+        ),
+        (
+            "schemas/local-dispatch-envelope.schema.json",
+            LOCAL_ENVELOPE_SCHEMA_SHA256,
+            "local envelope schema",
+        ),
+    ):
+        schema_path = root / relative
+        try:
+            schema = json.loads(schema_path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError) as err:
             failures += 1
-            print("[FAIL] local receipt schema drifted from the reviewed contract")
+            print(f"[FAIL] {schema_path.relative_to(root)}: unreadable ({err})")
         else:
-            print("[PASS] local receipt schema matches the reviewed contract")
+            observed = canonical_json_sha256(schema)
+            if observed != expected_hash:
+                failures += 1
+                print(f"[FAIL] {label} drifted from the reviewed contract")
+            else:
+                print(f"[PASS] {label} matches the reviewed contract")
 
-    dispatcher = root / "bin" / "codex-tier"
-    if not dispatcher.is_file() or not os.access(dispatcher, os.X_OK):
+    launcher = root / "bin" / "codex-tier"
+    dispatcher = root / "bin" / "codex-tier.py"
+    if not launcher.is_file() or not os.access(launcher, os.X_OK):
         failures += 1
-        print("[FAIL] bin/codex-tier: missing or not executable")
+        print("[FAIL] bin/codex-tier: launcher missing or not executable")
+    else:
+        failures += check_command(
+            root, ["/bin/sh", "-n", str(launcher)], "bin/codex-tier shell syntax"
+        )
+    if not dispatcher.is_file():
+        failures += 1
+        print("[FAIL] bin/codex-tier.py: runtime missing")
     else:
         with tempfile.TemporaryDirectory(
             prefix="codex-tier-validate-pycache-"
@@ -146,9 +355,13 @@ def main() -> int:
             )
         if result.returncode:
             failures += 1
-            print(f"[FAIL] bin/codex-tier: compile failed ({result.stderr.strip()})")
+            print(f"[FAIL] bin/codex-tier.py: compile failed ({result.stderr.strip()})")
         else:
-            print("[PASS] bin/codex-tier: executable and compiles")
+            print("[PASS] bin/codex-tier.py: runtime compiles")
+
+    failures += check_command(
+        root, ["/bin/sh", "-n", "install.sh"], "install.sh shell syntax"
+    )
 
     required_agent_fields = (
         "name",
@@ -194,9 +407,12 @@ def main() -> int:
             f"[FAIL] agent names: expected {sorted(expected_names)}, got {sorted(names)}"
         )
     else:
-        print("[PASS] agent names match the fixed route table")
+        print("[PASS] agent names match the stable route table")
 
     failures += check_readme_links(root)
+    failures += check_default_policy_alignment(root)
+    failures += check_release_metadata(root)
+    failures += check_public_privacy(root)
 
     if failures:
         print(f"[FAIL] validation completed with {failures} issue(s)")

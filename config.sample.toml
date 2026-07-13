@@ -10,6 +10,7 @@
 # model = "gpt-5.6-sol"
 # model_reasoning_effort = "medium"
 
-# Native routing uses agents/*.toml when the active host can select them.
-# Tool-backed surfaces may instead use ~/.codex/bin/codex-tier.
+# Native routing uses the shipped defaults in agents/*.toml when the active host
+# can select them. Custom model/effort mappings apply to the receipt-bearing
+# ~/.codex/bin/codex-tier dispatcher, not to these static profile files.
 # Omit model/model_reasoning_effort fields to inherit parent defaults.
