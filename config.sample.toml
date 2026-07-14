@@ -1,0 +1,16 @@
+# Project: codex-tier-routing
+# Original project by: 0xTitanas
+# Canonical source: https://github.com/0xTitanas/codex-tier-routing
+# Copyright: 2026 0xTitanas
+# SPDX-License-Identifier: MIT
+# Reference-only template for ~/.codex/config.toml (opt in).
+# Enable only if you understand and have validated the names in your installed CLI.
+# Verify key names against your installed version.
+
+# model = "gpt-5.6-sol"
+# model_reasoning_effort = "medium"
+
+# Native routing uses the shipped defaults in agents/*.toml when the active host
+# can select them. Custom model/effort mappings apply to the receipt-bearing
+# ~/.codex/bin/codex-tier dispatcher, not to these static profile files.
+# Omit model/model_reasoning_effort fields to inherit parent defaults.

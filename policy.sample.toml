@@ -1,0 +1,25 @@
+schema = "codex-tier-routing/policy/v1"
+
+# Only model and effort are configurable. Route sandbox and approval boundaries
+# remain fixed in the dispatcher. After editing, run `codex-tier policy-check`,
+# then one bounded canary for every route whose model or effort changed.
+
+[routes.scout]
+model = "gpt-5.6-luna"
+effort = "low"
+
+[routes.grunt]
+model = "gpt-5.6-luna"
+effort = "low"
+
+[routes.builder]
+model = "gpt-5.6-terra"
+effort = "medium"
+
+[routes.reviewer]
+model = "gpt-5.6-terra"
+effort = "high"
+
+[routes.architect]
+model = "gpt-5.6-sol"
+effort = "xhigh"

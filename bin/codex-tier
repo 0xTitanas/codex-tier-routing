@@ -1,0 +1,192 @@
+#!/bin/sh
+# Project: codex-tier-routing
+# Original project by: 0xTitanas
+# Canonical source: https://github.com/0xTitanas/codex-tier-routing
+# Copyright: 2026 0xTitanas
+# SPDX-License-Identifier: MIT
+
+# Security boundary: this launcher is already executing when its checks begin.
+# From this point forward it executes no Python candidate until that candidate's
+# complete lexical and resolved path has passed the local root/current-user
+# trust policy. The Python runtime repeats the same checks as defense in depth.
+
+set -eu
+
+error() {
+  printf 'codex-tier: %s\n' "$1" >&2
+  exit 1
+}
+
+ORIGINAL_PATH=${PATH:-}
+SAFE_PATH=$(command -p getconf PATH 2>/dev/null || printf '/usr/bin:/bin:/usr/sbin:/sbin')
+PATH=$SAFE_PATH
+export PATH
+
+unset PYTHONHOME PYTHONPATH PYTHONSTARTUP PYTHONINSPECT PYTHONUSERBASE
+unset LD_PRELOAD LD_LIBRARY_PATH LD_AUDIT
+unset DYLD_INSERT_LIBRARIES DYLD_LIBRARY_PATH DYLD_FRAMEWORK_PATH
+unset DYLD_FALLBACK_LIBRARY_PATH DYLD_FALLBACK_FRAMEWORK_PATH
+
+effective_uid=$(id -u 2>/dev/null || printf '')
+case "$effective_uid" in
+  ''|*[!0-9]*) error "unable to determine the effective UID" ;;
+esac
+
+platform=$(uname -s 2>/dev/null || printf '')
+case "$platform" in
+  Darwin)
+    owner_uid() { stat -f '%u' "$1" 2>/dev/null || printf ''; }
+    permission_mode() { stat -f '%Mp%Lp' "$1" 2>/dev/null || printf ''; }
+    ;;
+  Linux)
+    owner_uid() { stat -c '%u' "$1" 2>/dev/null || printf ''; }
+    permission_mode() { stat -c '%a' "$1" 2>/dev/null || printf ''; }
+    ;;
+  *) error "unsupported platform: ${platform:-unknown}" ;;
+esac
+
+REALPATH_BIN=$(command -v realpath 2>/dev/null || printf '')
+case "$REALPATH_BIN" in
+  /*) ;;
+  *) error "the system realpath utility is unavailable" ;;
+esac
+
+validate_darwin_acl() {
+  [ "$platform" = Darwin ] || return 0
+  acl_output=$(ls -lde "$1" 2>/dev/null) || error "unable to inspect ACLs for $2: $1"
+  if printf '%s\n' "$acl_output" | grep -Eq '^[[:space:]]*[0-9]+:.*[[:space:]]allow[[:space:]]'; then
+    error "refusing an ACL allow entry on $2: $1"
+  fi
+}
+
+validate_chain_components() {
+  chain_path=$1
+  chain_label=$2
+  case "$chain_path" in
+    /*) ;;
+    *) error "$chain_label must be absolute: $chain_path" ;;
+  esac
+
+  chain_current=/
+  chain_rest=${chain_path#/}
+  while :; do
+    [ -e "$chain_current" ] || [ -L "$chain_current" ] || error "missing $chain_label component: $chain_current"
+    chain_uid=$(owner_uid "$chain_current")
+    case "$chain_uid" in
+      ''|*[!0-9]*) error "unable to determine $chain_label ownership: $chain_current" ;;
+    esac
+    if [ "$chain_uid" != 0 ] && [ "$chain_uid" != "$effective_uid" ]; then
+      error "refusing a foreign-owned $chain_label component: $chain_current"
+    fi
+    if [ ! -L "$chain_current" ]; then
+      chain_mode=$(permission_mode "$chain_current")
+      case "$chain_mode" in
+        [0-7][0-7][0-7]|[0-7][0-7][0-7][0-7]) ;;
+        *) error "unable to determine $chain_label permissions: $chain_current" ;;
+      esac
+      chain_without_other=${chain_mode%?}
+      chain_group=${chain_without_other#${chain_without_other%?}}
+      chain_other=${chain_mode#${chain_mode%?}}
+      chain_sticky=0
+      if [ -d "$chain_current" ]; then
+        case "$(printf '%04s' "$chain_mode" | tr ' ' '0')" in
+          [1357]* ) chain_sticky=1 ;;
+        esac
+      fi
+      if [ "$chain_sticky" = 0 ]; then
+        case "$chain_other" in
+          [2367]) error "refusing a world-writable $chain_label component: $chain_current" ;;
+        esac
+        if [ "$chain_uid" != "$effective_uid" ]; then
+          case "$chain_group" in
+            [2367]) error "refusing a group-writable foreign $chain_label component: $chain_current" ;;
+          esac
+        fi
+      fi
+      validate_darwin_acl "$chain_current" "$chain_label"
+    fi
+
+    [ -n "$chain_rest" ] || break
+    chain_component=${chain_rest%%/*}
+    case "$chain_component" in
+      ''|.|..) error "$chain_label contains an unsafe lexical component: $chain_path" ;;
+    esac
+    if [ "$chain_current" = / ]; then
+      chain_current=/$chain_component
+    else
+      chain_current=$chain_current/$chain_component
+    fi
+    [ "$chain_component" = "$chain_rest" ] && chain_rest= || chain_rest=${chain_rest#*/}
+  done
+}
+
+validate_trusted_path() {
+  trusted_path=$1
+  trusted_label=$2
+  validate_chain_components "$trusted_path" "$trusted_label"
+  trusted_resolved=$($REALPATH_BIN "$trusted_path" 2>/dev/null || printf '')
+  case "$trusted_resolved" in
+    /*) ;;
+    *) error "unable to resolve $trusted_label: $trusted_path" ;;
+  esac
+  validate_chain_components "$trusted_resolved" "resolved $trusted_label"
+  printf '%s\n' "$trusted_resolved"
+}
+
+case "$0" in
+  /*) launcher_path=$0 ;;
+  */*)
+    launcher_relative=$0
+    while [ "${launcher_relative#./}" != "$launcher_relative" ]; do
+      launcher_relative=${launcher_relative#./}
+    done
+    launcher_path=$PWD/$launcher_relative
+    ;;
+  *)
+    launcher_path=$(PATH="${ORIGINAL_PATH:-$SAFE_PATH}" command -v "$0" 2>/dev/null || printf '')
+    ;;
+esac
+case "$launcher_path" in
+  /*) ;;
+  *) error "unable to resolve the launcher path" ;;
+esac
+launcher_path=$(validate_trusted_path "$launcher_path" "launcher path")
+launcher_dir=${launcher_path%/*}
+runtime_path=$(validate_trusted_path "$launcher_dir/codex-tier.py" "Python runtime path")
+[ -f "$runtime_path" ] && [ -r "$runtime_path" ] || error "Python runtime is not a readable regular file"
+CODEX_TIER_LAUNCHER_PATH=$launcher_path
+export CODEX_TIER_LAUNCHER_PATH
+
+SEARCH_PATH=${ORIGINAL_PATH:-$SAFE_PATH}
+PYTHON_BIN=${CODEX_TIER_PYTHON_BIN:-}
+if [ -n "$PYTHON_BIN" ]; then
+  case "$PYTHON_BIN" in
+    /*) ;;
+    *) error "CODEX_TIER_PYTHON_BIN must be absolute" ;;
+  esac
+  PYTHON_BIN=$(validate_trusted_path "$PYTHON_BIN" "Python interpreter path")
+  [ -f "$PYTHON_BIN" ] && [ -x "$PYTHON_BIN" ] || error "Python interpreter is not an executable regular file"
+  if ! "$PYTHON_BIN" -I -c 'import sys; raise SystemExit(0 if sys.version_info >= (3, 11) else 1)' 2>/dev/null; then
+    error "CODEX_TIER_PYTHON_BIN must be Python 3.11 or newer"
+  fi
+else
+  for version in python3.11 python3.12 python3.13 python3.14 python3.15 python3; do
+    candidate=$(PATH="$SEARCH_PATH" command -v "$version" 2>/dev/null || printf '')
+    [ -n "$candidate" ] || continue
+    case "$candidate" in
+      /*) ;;
+      *) continue ;;
+    esac
+    candidate=$(validate_trusted_path "$candidate" "Python interpreter path")
+    [ -f "$candidate" ] && [ -x "$candidate" ] || error "Python interpreter is not an executable regular file"
+    if "$candidate" -I -c 'import sys; raise SystemExit(0 if sys.version_info >= (3, 11) else 1)' 2>/dev/null; then
+      PYTHON_BIN=$candidate
+      break
+    fi
+  done
+fi
+
+[ -n "$PYTHON_BIN" ] || error "Python 3.11 or newer is unavailable"
+PATH=${ORIGINAL_PATH:-$SAFE_PATH}
+export PATH
+exec "$PYTHON_BIN" -I "$runtime_path" "$@"
