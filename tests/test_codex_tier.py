@@ -29,6 +29,7 @@ from unittest import mock
 ROOT = Path(__file__).resolve().parents[1]
 LAUNCHER = ROOT / "bin" / "codex-tier"
 DISPATCHER = ROOT / "bin" / "codex-tier.py"
+TRUSTED_PYTHON = Path(os.environ.get("CODEX_TIER_PYTHON_BIN", sys.executable)).resolve()
 DISPATCHER_SPEC = importlib.util.spec_from_loader(
     "codex_tier", importlib.machinery.SourceFileLoader("codex_tier", str(DISPATCHER))
 )
@@ -939,16 +940,30 @@ class DispatcherTests(unittest.TestCase):
         )
         fake_codex.chmod(0o755)
         env = os.environ.copy()
+        loader_env = {"LD_PRELOAD": str(self.base / "evil.so")}
+        if sys.platform == "darwin":
+            # dyld processes this variable before /bin/sh can unset it, so a
+            # missing test dylib would abort before the launcher runs.
+            launcher_source = self.launcher.read_text(encoding="utf-8")
+            self.assertIn(
+                "unset DYLD_INSERT_LIBRARIES DYLD_LIBRARY_PATH DYLD_FRAMEWORK_PATH",
+                launcher_source,
+            )
+            self.assertLess(
+                launcher_source.index("unset DYLD_INSERT_LIBRARIES"),
+                launcher_source.index("PYTHON_BIN="),
+            )
+        else:
+            loader_env["DYLD_INSERT_LIBRARIES"] = str(self.base / "evil.dylib")
         env.update(
             {
                 "CODEX_HOME": str(self.home),
                 "CODEX_TIER_CODEX_BIN": str(fake_codex),
-                "LD_PRELOAD": str(self.base / "evil.so"),
-                "DYLD_INSERT_LIBRARIES": str(self.base / "evil.dylib"),
                 "PYTHONPATH": str(self.base / "evil"),
                 "PYTHONSTARTUP": str(self.base / "evil.py"),
                 "PYTHONHOME": str(self.base / "evil-home"),
                 "EVIL_EXTRA": "should_not_propagate",
+                **loader_env,
             }
         )
         result = subprocess.run(
@@ -986,14 +1001,26 @@ class DispatcherTests(unittest.TestCase):
         )
         fake_codex.chmod(0o755)
         env = os.environ.copy()
+        loader_env = {"LD_PRELOAD": str(self.base / "evil.so")}
+        if sys.platform == "darwin":
+            launcher_source = self.launcher.read_text(encoding="utf-8")
+            self.assertIn(
+                "unset DYLD_INSERT_LIBRARIES DYLD_LIBRARY_PATH DYLD_FRAMEWORK_PATH",
+                launcher_source,
+            )
+            self.assertLess(
+                launcher_source.index("unset DYLD_INSERT_LIBRARIES"),
+                launcher_source.index("PYTHON_BIN="),
+            )
+        else:
+            loader_env["DYLD_INSERT_LIBRARIES"] = str(self.base / "evil.dylib")
         env.update(
             {
                 "CODEX_HOME": str(self.home),
                 "CODEX_TIER_CODEX_BIN": str(fake_codex),
                 "PYTHONPATH": str(startup),
                 "PYTHONHOME": str(self.base / "evil-home"),
-                "LD_PRELOAD": str(self.base / "evil.so"),
-                "DYLD_INSERT_LIBRARIES": str(self.base / "evil.dylib"),
+                **loader_env,
             }
         )
         result = subprocess.run(
@@ -1042,7 +1069,7 @@ class DispatcherTests(unittest.TestCase):
         compatible_dir.mkdir(mode=0o770)
         compatible_dir.chmod(0o770)
         python_link = compatible_dir / "python3"
-        python_link.symlink_to(Path(sys.executable).resolve())
+        python_link.symlink_to(TRUSTED_PYTHON)
         env = os.environ.copy()
         env.update(
             {
@@ -1097,7 +1124,7 @@ class DispatcherTests(unittest.TestCase):
                 "PATH": f"{unsafe_dir}{os.pathsep}{env.get('PATH', '')}",
                 "CODEX_HOME": str(self.home),
                 "CODEX_TIER_CODEX_BIN": str(entrypoint),
-                "CODEX_TIER_PYTHON_BIN": str(Path(sys.executable).resolve()),
+                "CODEX_TIER_PYTHON_BIN": str(TRUSTED_PYTHON),
             }
         )
         result = subprocess.run(
@@ -2557,7 +2584,9 @@ class DispatcherTests(unittest.TestCase):
                     argv_record.unlink()
                 result = self.run_dispatch(
                     prompt_file=path,
-                    harness_timeout=1 if path == fifo else 15,
+                    # macOS path-trust checks can exceed one second before the
+                    # dispatcher rejects the FIFO without opening it.
+                    harness_timeout=5 if path == fifo else 15,
                 )
                 self.assertEqual(result.returncode, 2)
                 self.assertFalse(argv_record.exists())

@@ -58,11 +58,13 @@ jobs:
         uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
         with:
           python-version: ${{ matrix.python }}
-      - name: Prepare safe interpreter for trust validation
+      - name: Harden macOS Python framework permissions
+        if: runner.os == 'macOS'
+        shell: bash
         run: |
-          SAFE_VENV="$RUNNER_TEMP/safe-python"
-          python3 -m venv --copies "$SAFE_VENV"
-          echo "$SAFE_VENV/bin" >> "$GITHUB_PATH"
+          FRAMEWORK_VERSIONS="$(python3 -c 'from pathlib import Path; import sys; print(Path(sys.base_prefix).resolve().parent)')"
+          test "$(basename "$FRAMEWORK_VERSIONS")" = "Versions"
+          sudo chmod g-w "$FRAMEWORK_VERSIONS"
       - name: Validate repository
         run: python3 scripts/validate.py
       - name: Run unit tests

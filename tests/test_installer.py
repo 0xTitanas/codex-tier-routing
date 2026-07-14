@@ -145,7 +145,18 @@ class InstallerTests(unittest.TestCase):
         env["PYTHONPATH"] = str(startup)
         env["PYTHONHOME"] = str(self.base / "missing-python-home")
         env["LD_PRELOAD"] = str(self.base / "missing-library.so")
-        env["DYLD_INSERT_LIBRARIES"] = str(self.base / "missing-library.dylib")
+        if sys.platform == "darwin":
+            installer_source = (ROOT / "install.sh").read_text(encoding="utf-8")
+            self.assertIn(
+                "unset DYLD_INSERT_LIBRARIES DYLD_LIBRARY_PATH DYLD_FRAMEWORK_PATH",
+                installer_source,
+            )
+            self.assertLess(
+                installer_source.index("unset DYLD_INSERT_LIBRARIES"),
+                installer_source.index("PYTHON_BIN="),
+            )
+        else:
+            env["DYLD_INSERT_LIBRARIES"] = str(self.base / "missing-library.dylib")
         result = self.install(ROOT, "--strict", "--dry-run", env=env)
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         self.assertFalse(marker.exists())
@@ -169,6 +180,7 @@ class InstallerTests(unittest.TestCase):
             safe_bin.mkdir(mode=0o700)
             (safe_bin / "python3").symlink_to(unsafe_python)
             env = os.environ.copy()
+            env.pop("CODEX_TIER_PYTHON_BIN", None)
             env["PATH"] = f"{safe_bin}"
             result = self.install(
                 ROOT, "--strict", "--dry-run", env=env, test_build=False

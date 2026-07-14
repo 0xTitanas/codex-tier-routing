@@ -81,7 +81,7 @@ PUBLIC_WINDOWS_HOME_PATTERN = re.compile(
 )
 PUBLIC_IPV4_PATTERN = re.compile(r"(?<![0-9])(?:[0-9]{1,3}\.){3}[0-9]{1,3}(?![0-9])")
 
-CI_WORKFLOW_SHA256 = "ac86c88fae039221c91d06d0370f914eb7c8a601146bd36566730c37ac35cf18"
+CI_WORKFLOW_SHA256 = "12649084ec63e81a87a08759c755c8f6fe75831cbc6d1550579e3f8229e3411f"
 
 
 def canonical_json_sha256(payload: object) -> str:
