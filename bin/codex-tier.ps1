@@ -22,37 +22,99 @@ $script:TrustedAclSids = @($script:TrustedOwnerSids) + 'S-1-3-4'
 $script:ReplaceRights = [uint32](0x10000000 -bor 0x00080000 -bor 0x00040000 -bor 0x00010000 -bor 0x40)
 $script:WriteRights = [uint32]($script:ReplaceRights -bor 0x40000000 -bor 0x02 -bor 0x04 -bor 0x10 -bor 0x100)
 
+function Initialize-NativeAcl {
+    if ($null -ne ('CodexTier.NativeAcl' -as [type])) {
+        return
+    }
+    Add-Type -TypeDefinition @'
+using System;
+using System.Runtime.InteropServices;
+namespace CodexTier {
+    [StructLayout(LayoutKind.Sequential)]
+    public struct AclSizeInformation {
+        public uint AceCount;
+        public uint AclBytesInUse;
+        public uint AclBytesFree;
+    }
+    public static class NativeAcl {
+        [DllImport("advapi32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+        public static extern uint GetNamedSecurityInfo(
+            string name, uint objectType, uint securityInfo,
+            out IntPtr owner, IntPtr group, out IntPtr dacl, IntPtr sacl,
+            out IntPtr descriptor);
+        [DllImport("advapi32.dll", SetLastError = true)]
+        [return: MarshalAs(UnmanagedType.Bool)]
+        public static extern bool GetAclInformation(
+            IntPtr acl, ref AclSizeInformation information,
+            uint informationLength, int informationClass);
+        [DllImport("advapi32.dll", SetLastError = true)]
+        [return: MarshalAs(UnmanagedType.Bool)]
+        public static extern bool GetAce(IntPtr acl, uint index, out IntPtr ace);
+        [DllImport("kernel32.dll")]
+        public static extern IntPtr LocalFree(IntPtr memory);
+        public static uint ReadMask(IntPtr ace) {
+            return unchecked((uint)Marshal.ReadInt32(ace, 4));
+        }
+    }
+}
+'@
+}
+
 function Assert-SafeAcl([string]$Path, [string]$Label, [bool]$Final) {
+    [IntPtr]$descriptor = [IntPtr]::Zero
     try {
-        $acl = Get-Acl -LiteralPath $Path
-        $descriptor = [Security.AccessControl.RawSecurityDescriptor]::new(
-            $acl.GetSecurityDescriptorBinaryForm(), 0
+        Initialize-NativeAcl
+        [IntPtr]$owner = [IntPtr]::Zero
+        [IntPtr]$dacl = [IntPtr]::Zero
+        $result = [CodexTier.NativeAcl]::GetNamedSecurityInfo(
+            $Path, 1, 0x00000001 -bor 0x00000004,
+            [ref]$owner, [IntPtr]::Zero, [ref]$dacl, [IntPtr]::Zero,
+            [ref]$descriptor
         )
+        if ($result -ne 0) {
+            Stop-Unsafe "unable to inspect the Windows ACL for $Label"
+        }
+        if ($owner -eq [IntPtr]::Zero -or $script:TrustedOwnerSids -notcontains ([Security.Principal.SecurityIdentifier]::new($owner).Value)) {
+            Stop-Unsafe "$Label has an untrusted Windows owner"
+        }
+        if ($dacl -eq [IntPtr]::Zero) {
+            Stop-Unsafe "$Label has an unverifiable Windows ACL"
+        }
+        $information = New-Object CodexTier.AclSizeInformation
+        if (-not [CodexTier.NativeAcl]::GetAclInformation($dacl, [ref]$information, [uint32][Runtime.InteropServices.Marshal]::SizeOf([type][CodexTier.AclSizeInformation]), 2)) {
+            Stop-Unsafe "unable to inspect the Windows ACL entries for $Label"
+        }
+        $dangerous = if ($Final) { $script:WriteRights } else { $script:ReplaceRights }
+        for ($index = 0; $index -lt $information.AceCount; $index++) {
+            [IntPtr]$ace = [IntPtr]::Zero
+            if (-not [CodexTier.NativeAcl]::GetAce($dacl, $index, [ref]$ace)) {
+                Stop-Unsafe "unable to inspect the Windows ACL entry for $Label"
+            }
+            $flags = [Runtime.InteropServices.Marshal]::ReadByte($ace, 1)
+            if (($flags -band 0x08) -ne 0) {
+                continue
+            }
+            $mask = [CodexTier.NativeAcl]::ReadMask($ace)
+            $type = [Runtime.InteropServices.Marshal]::ReadByte($ace, 0)
+            if (($mask -band $dangerous) -eq 0 -or $type -in @(1, 6, 10, 12)) {
+                continue
+            }
+            if ($type -ne 0) {
+                Stop-Unsafe "$Label has an unverifiable Windows ACE"
+            }
+            $sid = [Security.Principal.SecurityIdentifier]::new([IntPtr]::Add($ace, 8)).Value
+            if ($script:TrustedAclSids -notcontains $sid) {
+                Stop-Unsafe "$Label grants write access outside the trusted Windows identities"
+            }
+        }
     } catch {
+        if ($_.Exception.Message -like 'codex-tier:*') {
+            throw
+        }
         Stop-Unsafe "unable to inspect the Windows ACL for $Label"
-    }
-    if ($null -eq $descriptor.Owner -or $script:TrustedOwnerSids -notcontains $descriptor.Owner.Value) {
-        Stop-Unsafe "$Label has an untrusted Windows owner"
-    }
-    if ($null -eq $descriptor.DiscretionaryAcl) {
-        Stop-Unsafe "$Label has an unverifiable Windows ACL"
-    }
-    $dangerous = if ($Final) { $script:WriteRights } else { $script:ReplaceRights }
-    foreach ($ace in $descriptor.DiscretionaryAcl) {
-        if (([int]$ace.AceFlags -band [int][Security.AccessControl.AceFlags]::InheritOnly) -ne 0) {
-            continue
-        }
-        if (([uint32]$ace.AccessMask -band $dangerous) -eq 0) {
-            continue
-        }
-        if ($ace -isnot [Security.AccessControl.QualifiedAce]) {
-            Stop-Unsafe "$Label has an unverifiable Windows ACE"
-        }
-        if ($ace.AceQualifier -ne [Security.AccessControl.AceQualifier]::AccessAllowed) {
-            continue
-        }
-        if ($null -eq $ace.SecurityIdentifier -or $script:TrustedAclSids -notcontains $ace.SecurityIdentifier.Value) {
-            Stop-Unsafe "$Label grants write access outside the trusted Windows identities"
+    } finally {
+        if ($descriptor -ne [IntPtr]::Zero) {
+            [void][CodexTier.NativeAcl]::LocalFree($descriptor)
         }
     }
 }

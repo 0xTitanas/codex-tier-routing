@@ -67,6 +67,74 @@ jobs:
       - name: Verify system Python
         if: ${{ matrix.system_python }}
         run: test "$(python3 -c 'import sys; print(f"{sys.version_info.major}.{sys.version_info.minor}")')" = "${{ matrix.python }}"
+      - name: Harden Linux Python path
+        if: ${{ runner.os == 'Linux' && !matrix.system_python }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          case "$pythonLocation" in
+            /opt/hostedtoolcache/Python/*/*) ;;
+            *) echo 'setup-python location is outside the hosted tool cache' >&2; exit 1 ;;
+          esac
+          PYTHON_PREFIX="$(/usr/bin/realpath "$pythonLocation")"
+          case "$PYTHON_PREFIX" in
+            /opt/hostedtoolcache/Python/*/*) ;;
+            *) echo 'resolved setup-python location escaped the hosted tool cache' >&2; exit 1 ;;
+          esac
+          PYTHON_INTERPRETER="$(/usr/bin/realpath "$PYTHON_PREFIX/bin/python")"
+          case "$PYTHON_INTERPRETER" in
+            "$PYTHON_PREFIX"/bin/python*) ;;
+            *) echo 'resolved Python interpreter escaped its installation' >&2; exit 1 ;;
+          esac
+          PYTHON_COMPONENT="$PYTHON_PREFIX"
+          while :; do
+            sudo chmod go-w "$PYTHON_COMPONENT"
+            test "$PYTHON_COMPONENT" = / && break
+            PYTHON_COMPONENT="${PYTHON_COMPONENT%/*}"
+            test -n "$PYTHON_COMPONENT" || PYTHON_COMPONENT=/
+          done
+          sudo chmod -R go-w "$PYTHON_PREFIX"
+          /usr/bin/env -u LD_PRELOAD -u LD_LIBRARY_PATH -u LD_AUDIT \
+            "$PYTHON_INTERPRETER" -I - "$PYTHON_PREFIX" "$PYTHON_INTERPRETER" <<'PY'
+          import os
+          from pathlib import Path
+          import stat
+          import sys
+
+          prefix = Path(sys.argv[1]).resolve(strict=True)
+          interpreter = Path(sys.argv[2]).resolve(strict=True)
+          trusted_owners = {0, os.geteuid()}
+
+          if Path(sys.base_prefix).resolve(strict=True) != prefix:
+              raise SystemExit("Python base prefix changed during hardening")
+          if Path(sys.executable).resolve(strict=True) != interpreter:
+              raise SystemExit("Python interpreter changed during hardening")
+
+          def check_component(current: Path) -> None:
+              details = current.lstat()
+              if details.st_uid not in trusted_owners:
+                  raise SystemExit(f"foreign-owned Python component: {current}")
+              if not stat.S_ISLNK(details.st_mode) and details.st_mode & (stat.S_IWGRP | stat.S_IWOTH):
+                  raise SystemExit(f"writable Python component: {current}")
+
+          def check_chain(path: Path) -> None:
+              current = Path(path.anchor)
+              check_component(current)
+              for part in path.parts[1:]:
+                  current /= part
+                  check_component(current)
+
+          check_chain(prefix)
+          check_chain(interpreter)
+          for root, directories, files in os.walk(prefix, followlinks=False):
+              for name in (*directories, *files):
+                  current = Path(root, name)
+                  check_component(current)
+                  if current.is_symlink():
+                      check_chain(current.resolve(strict=True))
+          PY
+          CODEX_TIER_PYTHON_BIN="$PYTHON_INTERPRETER" ./bin/codex-tier --version
+          echo "CODEX_TIER_PYTHON_BIN=$PYTHON_INTERPRETER" >> "$GITHUB_ENV"
       - name: Harden macOS tool paths
         if: runner.os == 'macOS'
         shell: bash
