@@ -5,7 +5,7 @@
 **Stable Codex task routes, configurable model/effort mappings, and host-observed receipts.**
 
 [![License: MIT](https://img.shields.io/badge/license-MIT-2ea44f.svg)](LICENSE)
-[![Release: v1.0.0-rc.2](https://img.shields.io/badge/release-v1.0.0--rc.1-f0ad4e.svg)](CHANGELOG.md)
+[![Release: v1.0.0-rc.2](https://img.shields.io/badge/release-v1.0.0--rc.2-f0ad4e.svg)](CHANGELOG.md)
 [![Platforms: macOS + Linux](https://img.shields.io/badge/platforms-macOS%20%2B%20Linux-4c78ff.svg)](docs/compatibility.md)
 
 </div>
