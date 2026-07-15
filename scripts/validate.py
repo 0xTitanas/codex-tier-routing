@@ -23,12 +23,14 @@ REQUIRED_SKILL_MARKERS = (
     "Check capability first",
     "Local dispatcher",
     "codex-tier-routing/local-dispatch-receipt/v2",
+    "codex-tier-routing/local-dispatch-receipt/v3",
     "dispatcher_configured_and_host_observed",
     "Cap concurrent dispatches at four",
     "Do not automatically retry",
     "policy-check",
     "receipt-check",
     "policy.toml",
+    "surgeon",
 )
 
 REQUIRED_LOCAL_GUIDE_MARKERS = (
@@ -40,6 +42,7 @@ REQUIRED_LOCAL_GUIDE_MARKERS = (
     "policy-check",
     "receipt-check",
     "policy.toml",
+    "codex-tier-routing/local-dispatch-receipt/v3",
 )
 
 REQUIRED_PUBLIC_FILES = (
@@ -59,11 +62,19 @@ REQUIRED_PUBLIC_FILES = (
     "policy.sample.toml",
     "schemas/local-dispatch-receipt.schema.json",
     "schemas/local-dispatch-envelope.schema.json",
+    "schemas/local-dispatch-receipt-v3.schema.json",
+    "schemas/local-dispatch-envelope-v3.schema.json",
 )
 
-LOCAL_SCHEMA_SHA256 = "bc332117e5d7bc3d3199159c507d9d43bf8c9bde487cbe912a89e173853a0c07"
+LOCAL_SCHEMA_SHA256 = "e30a229e33ec6a4f2658eec8d595a73dcc302cb6f48d25b5ca322f239b10bd42"
 LOCAL_ENVELOPE_SCHEMA_SHA256 = (
-    "975f28062803a6bb9dcea8e794898c3f71321f2d235d5301faf6170901ea84fb"
+    "bb80ad56a1eec1a2139a9c6124f73582e54862e768960220265f1d73e53b6010"
+)
+LOCAL_V3_SCHEMA_SHA256 = (
+    "f2ec6dd7fd614867d7bf45127285c0a2d42029db1209a0b368fefb944878fc41"
+)
+LOCAL_V3_ENVELOPE_SCHEMA_SHA256 = (
+    "84d67c92eac18fb075fb40705c4241754c7151aa33c2712e5850de698048f368"
 )
 
 ALLOWED_PUBLIC_EMAIL_DOMAINS = frozenset(
@@ -80,13 +91,9 @@ PUBLIC_WINDOWS_HOME_PATTERN = re.compile(
     r"(?i)(?:[A-Z]:[\\/])Users[\\/][A-Za-z0-9._-]+"
 )
 PUBLIC_IPV4_PATTERN = re.compile(r"(?<![0-9])(?:[0-9]{1,3}\.){3}[0-9]{1,3}(?![0-9])")
+PUBLIC_LAB_HOST_PATTERN = re.compile(r"\b[a-z][a-z0-9-]*-lab\b", re.IGNORECASE)
 
-CI_WORKFLOW_SHA256 = "12649084ec63e81a87a08759c755c8f6fe75831cbc6d1550579e3f8229e3411f"
-
-
-def canonical_json_sha256(payload: object) -> str:
-    encoded = json.dumps(payload, sort_keys=True, separators=(",", ":")).encode()
-    return hashlib.sha256(encoded).hexdigest()
+CI_WORKFLOW_SHA256 = "d7a1fd52f156afaad5132fc49a456694cfae4b057b87e15373cdf51bf4751227"
 
 
 def check_markers(path: Path, markers: tuple[str, ...], root: Path) -> int:
@@ -131,6 +138,8 @@ def public_privacy_categories(text: str) -> tuple[str, ...]:
         text
     ):
         categories.add("personal home path")
+    if PUBLIC_LAB_HOST_PATTERN.search(text):
+        categories.add("local lab hostname")
     for match in PUBLIC_IPV4_PATTERN.finditer(text):
         octets = tuple(int(value) for value in match.group().split("."))
         if any(value > 255 for value in octets):
@@ -188,11 +197,15 @@ def check_public_privacy(root: Path) -> int:
     candidates = sorted(
         path
         for path in root.rglob("*")
-        if path.is_file()
+        if (path.is_file() or path.is_symlink())
         and not any(part in excluded_parts for part in path.relative_to(root).parts)
     )
     scanned = 0
     for path in candidates:
+        if path.is_symlink():
+            failures += 1
+            print(f"[FAIL] {path.relative_to(root)}: refusing symlink during text scan")
+            continue
         try:
             data = path.read_bytes()
         except OSError as err:
@@ -229,7 +242,7 @@ def check_ci_contract(root: Path) -> int:
     if digest != CI_WORKFLOW_SHA256:
         print("[FAIL] .github/workflows/ci.yml: reviewed CI contract changed")
         return 1
-    print("[PASS] CI matches the reviewed tag trigger and six-job test matrix")
+    print("[PASS] CI matches the reviewed 14-check matrix")
     return 0
 
 
@@ -282,8 +295,24 @@ def check_default_policy_alignment(root: Path) -> int:
         ):
             failures += 1
             print(f"[FAIL] agents/{name}.toml: default policy mismatch")
+    try:
+        surgeon = tomllib.loads(
+            (root / "agents" / "surgeon.toml").read_text(encoding="utf-8")
+        )
+    except (OSError, UnicodeError, tomllib.TOMLDecodeError) as err:
+        failures += 1
+        print(f"[FAIL] agents/surgeon.toml: invalid ({err})")
+    else:
+        if (
+            surgeon.get("name") != "surgeon"
+            or surgeon.get("model") != "gpt-5.6-sol"
+            or surgeon.get("model_reasoning_effort") != "high"
+            or surgeon.get("sandbox_mode") != "workspace-write"
+        ):
+            failures += 1
+            print("[FAIL] agents/surgeon.toml: fixed experimental route mismatch")
     if failures == 0:
-        print("[PASS] sample policy matches all packaged profile defaults")
+        print("[PASS] sample policy and fixed surgeon match packaged profiles")
     return failures
 
 
@@ -347,7 +376,7 @@ def check_release_metadata(root: Path) -> int:
     exact_lines = (
         (
             readme,
-            f"The current release candidate is `v{version}`. It is feature-complete within",
+            f"The current release candidate is `v{version}`. It remains a candidate until",
             "README release",
         ),
         (citation, f"version: {version}", "citation version"),
@@ -423,15 +452,26 @@ def main() -> int:
             LOCAL_ENVELOPE_SCHEMA_SHA256,
             "local envelope schema",
         ),
+        (
+            "schemas/local-dispatch-receipt-v3.schema.json",
+            LOCAL_V3_SCHEMA_SHA256,
+            "local v3 receipt schema",
+        ),
+        (
+            "schemas/local-dispatch-envelope-v3.schema.json",
+            LOCAL_V3_ENVELOPE_SCHEMA_SHA256,
+            "local v3 envelope schema",
+        ),
     ):
         schema_path = root / relative
         try:
-            schema = json.loads(schema_path.read_text(encoding="utf-8"))
-        except (OSError, json.JSONDecodeError) as err:
+            raw = schema_path.read_bytes()
+            json.loads(raw)
+        except (OSError, UnicodeError, json.JSONDecodeError) as err:
             failures += 1
             print(f"[FAIL] {schema_path.relative_to(root)}: unreadable ({err})")
         else:
-            observed = canonical_json_sha256(schema)
+            observed = hashlib.sha256(raw).hexdigest()
             if observed != expected_hash:
                 failures += 1
                 print(f"[FAIL] {label} drifted from the reviewed contract")
@@ -512,14 +552,14 @@ def main() -> int:
                     names[name] = path
         print(f"[PASS] parsed TOML: {path.relative_to(root)}")
 
-    expected_names = {"scout", "grunt", "builder", "reviewer", "architect"}
+    expected_names = {"scout", "grunt", "builder", "reviewer", "architect", "surgeon"}
     if set(names) != expected_names:
         failures += 1
         print(
             f"[FAIL] agent names: expected {sorted(expected_names)}, got {sorted(names)}"
         )
     else:
-        print("[PASS] agent names match the stable route table")
+        print("[PASS] agent names match the stable and experimental route tables")
 
     failures += check_readme_links(root)
     failures += check_ci_contract(root)

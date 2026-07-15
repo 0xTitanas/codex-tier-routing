@@ -13,6 +13,7 @@ import importlib.util
 import json
 import os
 import re
+import shlex
 import shutil
 import stat
 import subprocess
@@ -20,6 +21,7 @@ import sys
 import tempfile
 import textwrap
 import time
+import tomllib
 import unittest
 import uuid
 from pathlib import Path
@@ -29,7 +31,6 @@ from unittest import mock
 ROOT = Path(__file__).resolve().parents[1]
 LAUNCHER = ROOT / "bin" / "codex-tier"
 DISPATCHER = ROOT / "bin" / "codex-tier.py"
-TRUSTED_PYTHON = Path(os.environ.get("CODEX_TIER_PYTHON_BIN", sys.executable)).resolve()
 DISPATCHER_SPEC = importlib.util.spec_from_loader(
     "codex_tier", importlib.machinery.SourceFileLoader("codex_tier", str(DISPATCHER))
 )
@@ -37,6 +38,15 @@ assert DISPATCHER_SPEC is not None and DISPATCHER_SPEC.loader is not None
 CODEX_TIER = importlib.util.module_from_spec(DISPATCHER_SPEC)
 sys.modules[DISPATCHER_SPEC.name] = CODEX_TIER
 DISPATCHER_SPEC.loader.exec_module(CODEX_TIER)
+VALIDATOR = ROOT / "scripts" / "validate.py"
+VALIDATOR_SPEC = importlib.util.spec_from_loader(
+    "codex_tier_validate",
+    importlib.machinery.SourceFileLoader("codex_tier_validate", str(VALIDATOR)),
+)
+assert VALIDATOR_SPEC is not None and VALIDATOR_SPEC.loader is not None
+CODEX_TIER_VALIDATE = importlib.util.module_from_spec(VALIDATOR_SPEC)
+sys.modules[VALIDATOR_SPEC.name] = CODEX_TIER_VALIDATE
+VALIDATOR_SPEC.loader.exec_module(CODEX_TIER_VALIDATE)
 
 RFC3339_DATETIME = re.compile(
     r"^(?P<year>[0-9]{4})-(?P<month>0[1-9]|1[0-2])-(?P<day>0[1-9]|[12][0-9]|3[01])"
@@ -264,7 +274,10 @@ def expand_envelope_schema(envelope: dict, receipt: dict) -> dict:
         if not isinstance(node, dict):
             return node
         reference = node.get("$ref")
-        if reference == "local-dispatch-receipt.schema.json":
+        if reference in {
+            "local-dispatch-receipt.schema.json",
+            "local-dispatch-receipt-v3.schema.json",
+        }:
             return expand(
                 {
                     key: value
@@ -448,8 +461,30 @@ if mode != "no_terminal":
 """
 
 
+class RepositoryValidatorTests(unittest.TestCase):
+    def test_public_privacy_scan_rejects_absolute_user_home_path(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            (root / "README.md").write_text("$HOME/project", encoding="utf-8")
+            self.assertEqual(CODEX_TIER_VALIDATE.check_public_privacy(root), 0)
+            private_path = (
+                "/" + bytes((85, 115, 101, 114, 115)).decode() + "/example/project"
+            )
+            bare_homes = (
+                private_path.rsplit("/", 1)[0],
+                "/" + bytes((104, 111, 109, 101)).decode() + "/example",
+            )
+            for private_home in (*bare_homes, private_path):
+                (root / "Makefile").write_text(private_home, encoding="utf-8")
+                self.assertEqual(CODEX_TIER_VALIDATE.check_public_privacy(root), 1)
+            (root / "Makefile").write_text("clean", encoding="utf-8")
+            (root / "Dockerfile").write_text("synthetic-" + "lab", encoding="utf-8")
+            self.assertEqual(CODEX_TIER_VALIDATE.check_public_privacy(root), 1)
+
+
 class DispatcherTests(unittest.TestCase):
     def setUp(self) -> None:
+        self.addCleanup(os.umask, os.umask(0o077))
         self.temp = tempfile.TemporaryDirectory()
         # macOS exposes /var as a symlink to /private/var.  The dispatcher
         # validates the caller's complete lexical CODEX_HOME chain, so normal
@@ -544,6 +579,62 @@ class DispatcherTests(unittest.TestCase):
     def envelope(self, result: subprocess.CompletedProcess[str]) -> dict:
         return json.loads(result.stdout)
 
+    def writer_lock_path(self, workdir: Path) -> Path:
+        details = workdir.resolve().stat()
+        return (
+            CODEX_TIER.workspace_writer_lock_dir()
+            / f"workspace-write-{details.st_dev}-{details.st_ino}.lock"
+        )
+
+    def git(self, *args: str, cwd: Path | None = None) -> str:
+        executable = shutil.which("git")
+        self.assertIsNotNone(executable)
+        result = subprocess.run(
+            [executable, *args],
+            cwd=cwd,
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            check=False,
+        )
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        return result.stdout.strip()
+
+    def linked_worktree(self, *, object_format: str | None = None) -> tuple[Path, Path]:
+        suffix = uuid.uuid4().hex
+        primary = self.base / f"primary-{suffix}"
+        linked = self.base / f"linked-{suffix}"
+        init_args = ["init", "-q"]
+        if object_format is not None:
+            init_args.append(f"--object-format={object_format}")
+        self.git(*init_args, str(primary))
+        (primary / "tracked.txt").write_text("initial\n", encoding="utf-8")
+        self.git("-C", str(primary), "add", "tracked.txt")
+        self.git(
+            "-C",
+            str(primary),
+            "-c",
+            "user.name=Test",
+            "-c",
+            "user.email=fixture",
+            "-c",
+            "core.hooksPath=/dev/null",
+            "commit",
+            "-qm",
+            "initial",
+        )
+        self.git(
+            "-C",
+            str(primary),
+            "worktree",
+            "add",
+            "-q",
+            "-b",
+            f"surgeon-{suffix}",
+            str(linked),
+        )
+        return primary, linked
+
     def write_policy(
         self,
         *,
@@ -596,6 +687,17 @@ class DispatcherTests(unittest.TestCase):
         )
         self.assertEqual(payload["policy"]["kind"], "builtin")
         self.assertEqual(payload["policy"]["model_access"], "not_checked")
+        self.assertEqual(
+            payload["experimental_routes"],
+            {
+                "surgeon": {
+                    "model": "gpt-5.6-sol",
+                    "effort": "high",
+                    "sandbox": "workspace-write",
+                    "configurable": False,
+                }
+            },
+        )
         self.assertFalse((self.home / "argv.json").exists())
 
     def test_version_is_machine_readable_and_offline(self) -> None:
@@ -639,7 +741,36 @@ class DispatcherTests(unittest.TestCase):
         self.assertEqual(payload["model_catalog"], CODEX_TIER.MODEL_CATALOG_URL)
         self.assertEqual(payload["accepted_efforts"], list(CODEX_TIER.ACCEPTED_EFFORTS))
         self.assertIn("canary", payload["model_access_note"])
+        self.assertEqual(set(payload["routes"]), set(CODEX_TIER.ROUTES))
+        self.assertFalse(payload["experimental_routes"]["surgeon"]["configurable"])
         self.assertFalse((self.home / "argv.json").exists())
+
+    def test_v1_policy_stays_five_routes_and_cannot_configure_surgeon(self) -> None:
+        stable = {"scout", "grunt", "builder", "reviewer", "architect"}
+        self.assertEqual(set(CODEX_TIER.ROUTES), stable)
+        sample = tomllib.loads((ROOT / "policy.sample.toml").read_text())
+        self.assertEqual(sample["schema"], CODEX_TIER.POLICY_SCHEMA)
+        self.assertEqual(set(sample["routes"]), stable)
+        self.assertNotIn("surgeon", sample["routes"])
+
+        policy = self.write_policy()
+        policy.write_text(
+            policy.read_text()
+            + '\n[routes.surgeon]\nmodel = "owner-choice"\neffort = "none"\n',
+            encoding="utf-8",
+        )
+        policy.chmod(0o600)
+        env = {**os.environ, "CODEX_HOME": str(self.home)}
+        result = subprocess.run(
+            [str(self.launcher), "policy-check"],
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            env=env,
+            check=False,
+        )
+        self.assertEqual(result.returncode, 2)
+        self.assertIn("routes must be exactly", result.stdout)
 
     def test_custom_policy_changes_only_model_and_effort(self) -> None:
         policy_path = self.write_policy(overrides={"builder": ("gpt-5.6", "max")})
@@ -940,30 +1071,16 @@ class DispatcherTests(unittest.TestCase):
         )
         fake_codex.chmod(0o755)
         env = os.environ.copy()
-        loader_env = {"LD_PRELOAD": str(self.base / "evil.so")}
-        if sys.platform == "darwin":
-            # dyld processes this variable before /bin/sh can unset it, so a
-            # missing test dylib would abort before the launcher runs.
-            launcher_source = self.launcher.read_text(encoding="utf-8")
-            self.assertIn(
-                "unset DYLD_INSERT_LIBRARIES DYLD_LIBRARY_PATH DYLD_FRAMEWORK_PATH",
-                launcher_source,
-            )
-            self.assertLess(
-                launcher_source.index("unset DYLD_INSERT_LIBRARIES"),
-                launcher_source.index("PYTHON_BIN="),
-            )
-        else:
-            loader_env["DYLD_INSERT_LIBRARIES"] = str(self.base / "evil.dylib")
         env.update(
             {
                 "CODEX_HOME": str(self.home),
                 "CODEX_TIER_CODEX_BIN": str(fake_codex),
+                "LD_PRELOAD": str(self.base / "evil.so"),
+                "DYLD_INSERT_LIBRARIES": str(self.base / "evil.dylib"),
                 "PYTHONPATH": str(self.base / "evil"),
                 "PYTHONSTARTUP": str(self.base / "evil.py"),
                 "PYTHONHOME": str(self.base / "evil-home"),
                 "EVIL_EXTRA": "should_not_propagate",
-                **loader_env,
             }
         )
         result = subprocess.run(
@@ -1001,26 +1118,14 @@ class DispatcherTests(unittest.TestCase):
         )
         fake_codex.chmod(0o755)
         env = os.environ.copy()
-        loader_env = {"LD_PRELOAD": str(self.base / "evil.so")}
-        if sys.platform == "darwin":
-            launcher_source = self.launcher.read_text(encoding="utf-8")
-            self.assertIn(
-                "unset DYLD_INSERT_LIBRARIES DYLD_LIBRARY_PATH DYLD_FRAMEWORK_PATH",
-                launcher_source,
-            )
-            self.assertLess(
-                launcher_source.index("unset DYLD_INSERT_LIBRARIES"),
-                launcher_source.index("PYTHON_BIN="),
-            )
-        else:
-            loader_env["DYLD_INSERT_LIBRARIES"] = str(self.base / "evil.dylib")
         env.update(
             {
                 "CODEX_HOME": str(self.home),
                 "CODEX_TIER_CODEX_BIN": str(fake_codex),
                 "PYTHONPATH": str(startup),
                 "PYTHONHOME": str(self.base / "evil-home"),
-                **loader_env,
+                "LD_PRELOAD": str(self.base / "evil.so"),
+                "DYLD_INSERT_LIBRARIES": str(self.base / "evil.dylib"),
             }
         )
         result = subprocess.run(
@@ -1069,7 +1174,7 @@ class DispatcherTests(unittest.TestCase):
         compatible_dir.mkdir(mode=0o770)
         compatible_dir.chmod(0o770)
         python_link = compatible_dir / "python3"
-        python_link.symlink_to(TRUSTED_PYTHON)
+        python_link.symlink_to(Path(sys.executable).resolve())
         env = os.environ.copy()
         env.update(
             {
@@ -1124,7 +1229,7 @@ class DispatcherTests(unittest.TestCase):
                 "PATH": f"{unsafe_dir}{os.pathsep}{env.get('PATH', '')}",
                 "CODEX_HOME": str(self.home),
                 "CODEX_TIER_CODEX_BIN": str(entrypoint),
-                "CODEX_TIER_PYTHON_BIN": str(TRUSTED_PYTHON),
+                "CODEX_TIER_PYTHON_BIN": str(Path(sys.executable).resolve()),
             }
         )
         result = subprocess.run(
@@ -1335,10 +1440,10 @@ class DispatcherTests(unittest.TestCase):
 
     def test_all_routes_are_host_observed(self) -> None:
         expected = {
-            "scout": ("gpt-5.6-luna", "low", "read-only"),
+            "scout": ("gpt-5.6-terra", "low", "read-only"),
             "grunt": ("gpt-5.6-luna", "low", "workspace-write"),
             "builder": ("gpt-5.6-terra", "medium", "workspace-write"),
-            "reviewer": ("gpt-5.6-terra", "high", "read-only"),
+            "reviewer": ("gpt-5.6-sol", "high", "read-only"),
             "architect": ("gpt-5.6-sol", "xhigh", "read-only"),
         }
         for route, values in expected.items():
@@ -1349,6 +1454,8 @@ class DispatcherTests(unittest.TestCase):
                 self.assertEqual(envelope["result"], "FAKE_OK")
                 receipt = envelope["receipt"]
                 self.assertEqual(receipt["status"], "pass")
+                self.assertEqual(receipt["schema"], CODEX_TIER.SCHEMA)
+                self.assertEqual(set(receipt), CODEX_TIER.RECEIPT_FIELDS)
                 self.assertEqual(
                     (
                         receipt["observed"]["model"],
@@ -1535,34 +1642,94 @@ class DispatcherTests(unittest.TestCase):
         self.assertTrue((state_dir / "strict-config.json").is_file())
         self.assertTrue((state_dir / "strict-config.backup").is_file())
 
-    def test_strict_disable_refuses_config_drift(self) -> None:
-        env = os.environ.copy()
-        env.update(
-            {"CODEX_HOME": str(self.home), "CODEX_TIER_CODEX_BIN": str(self.fake)}
-        )
-        (self.home / "config.toml").write_text("[features]\nmulti_agent = true\n")
-        enable = subprocess.run(
-            [str(self.launcher), "strict-enable"],
-            text=True,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            env=env,
-            check=False,
-        )
-        self.assertEqual(enable.returncode, 0, enable.stdout + enable.stderr)
-        with (self.home / "config.toml").open("a") as handle:
-            handle.write("# user change\n")
-        disable = subprocess.run(
-            [str(self.launcher), "strict-disable"],
-            text=True,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            env=env,
-            check=False,
-        )
-        self.assertEqual(disable.returncode, 2)
-        self.assertIn("drifted", disable.stdout)
-        self.assertIn("# user change", (self.home / "config.toml").read_text())
+    def test_strict_disable_preserves_host_added_project_metadata(self) -> None:
+        config = self.home / "config.toml"
+        config.unlink()
+        with (
+            mock.patch.object(CODEX_TIER, "resolve_codex", return_value=self.fake),
+            mock.patch.object(
+                CODEX_TIER, "native_multi_agent_enabled", return_value=False
+            ),
+        ):
+            self.assertEqual(CODEX_TIER.strict_enable(mock.Mock(), self.home), 0)
+        addition = b'\n[projects."/synthetic/project"]\ntrust_level = "trusted"\n'
+        config.write_bytes(config.read_bytes() + addition)
+        self.assertEqual(CODEX_TIER.strict_disable(mock.Mock(), self.home), 0)
+        self.assertEqual(config.read_bytes(), addition)
+        self.assertFalse((self.home / "tier-routing" / "strict-config.json").exists())
+        self.assertFalse((self.home / "tier-routing" / "strict-config.backup").exists())
+
+    def test_strict_disable_preserves_additions_for_each_managed_edit(self) -> None:
+        addition = b'\n[projects."/synthetic/project"]\ntrust_level = "trusted"\n'
+        for label, before_exists, original in (
+            ("replace", True, b"[features]\nmulti_agent = true # keep\n"),
+            ("replace without newline", True, b"[features]\nmulti_agent = true"),
+            ("insert", True, b"[features]\nhooks = true\n"),
+            ("new table", False, b""),
+        ):
+            with self.subTest(case=label):
+                config = self.home / "config.toml"
+                config.unlink(missing_ok=True)
+                if before_exists:
+                    config.write_bytes(original)
+                with (
+                    mock.patch.object(
+                        CODEX_TIER, "resolve_codex", return_value=self.fake
+                    ),
+                    mock.patch.object(
+                        CODEX_TIER,
+                        "native_multi_agent_enabled",
+                        return_value=False,
+                    ),
+                ):
+                    self.assertEqual(
+                        CODEX_TIER.strict_enable(mock.Mock(), self.home), 0
+                    )
+                    config.write_bytes(config.read_bytes() + addition)
+                    self.assertEqual(
+                        CODEX_TIER.strict_enable(mock.Mock(), self.home), 0
+                    )
+                self.assertEqual(CODEX_TIER.strict_disable(mock.Mock(), self.home), 0)
+                self.assertEqual(config.read_bytes(), original + addition)
+
+    def test_strict_disable_recovers_after_merged_config_write(self) -> None:
+        config = self.home / "config.toml"
+        config.unlink()
+        with (
+            mock.patch.object(CODEX_TIER, "resolve_codex", return_value=self.fake),
+            mock.patch.object(
+                CODEX_TIER, "native_multi_agent_enabled", return_value=False
+            ),
+        ):
+            self.assertEqual(CODEX_TIER.strict_enable(mock.Mock(), self.home), 0)
+        addition = b'\n[projects."/synthetic/project"]\ntrust_level = "trusted"\n'
+        state = self.home / "tier-routing"
+        manifest_path = state / "strict-config.json"
+        manifest = json.loads(manifest_path.read_text())
+        manifest["state"] = "disabling"
+        manifest_path.write_text(json.dumps(manifest))
+        config.write_bytes(addition)
+        self.assertEqual(CODEX_TIER.strict_disable(mock.Mock(), self.home), 0)
+        self.assertEqual(config.read_bytes(), addition)
+        self.assertFalse(manifest_path.exists())
+        self.assertFalse((state / "strict-config.backup").exists())
+
+    def test_strict_disable_refuses_managed_setting_drift(self) -> None:
+        config = self.home / "config.toml"
+        config.write_text("[features]\nmulti_agent = true\n")
+        with (
+            mock.patch.object(CODEX_TIER, "resolve_codex", return_value=self.fake),
+            mock.patch.object(
+                CODEX_TIER, "native_multi_agent_enabled", return_value=False
+            ),
+        ):
+            self.assertEqual(CODEX_TIER.strict_enable(mock.Mock(), self.home), 0)
+        config.write_text(config.read_text().replace("false", "true"))
+        with self.assertRaisesRegex(CODEX_TIER.DispatchHalt, "drifted"):
+            CODEX_TIER.strict_disable(mock.Mock(), self.home)
+        self.assertIn("multi_agent = true", config.read_text())
+        self.assertTrue((self.home / "tier-routing" / "strict-config.json").exists())
+        self.assertTrue((self.home / "tier-routing" / "strict-config.backup").exists())
 
     def test_strict_disable_rejects_symlinked_config(self) -> None:
         for dangling in (False, True):
@@ -2240,6 +2407,183 @@ class DispatcherTests(unittest.TestCase):
         invalid["unexpected"] = True
         self.assertTrue(validate_local_schema(invalid, expanded))
 
+    def test_surgeon_pass_and_halt_match_v3_contract_and_receipt_check(self) -> None:
+        primary, linked = self.linked_worktree()
+        starting_head = self.git("-C", str(linked), "rev-parse", "HEAD")
+        passed = self.envelope(self.run_dispatch(route="surgeon", workdir=linked))
+        halted = self.envelope(self.run_dispatch(route="surgeon", workdir=primary))
+        late_halt = self.envelope(
+            self.run_dispatch(route="surgeon", workdir=linked, mode="wrong_model")
+        )
+
+        receipt = passed["receipt"]
+        self.assertEqual(receipt["schema"], CODEX_TIER.SURGEON_SCHEMA)
+        self.assertEqual(receipt["status"], "pass")
+        self.assertEqual(receipt["policy_id"], CODEX_TIER.DEFAULT_POLICY_V2_ID)
+        self.assertEqual(
+            receipt["workspace_precondition"],
+            {
+                "kind": "clean-linked-git-worktree",
+                "starting_head": starting_head,
+            },
+        )
+        self.assertEqual(
+            receipt["policy_document"]["schema"], "codex-tier-routing/policy/v2"
+        )
+        self.assertEqual(
+            set(receipt["policy_document"]["routes"]),
+            {*CODEX_TIER.ROUTES, "surgeon"},
+        )
+        self.assertEqual(
+            receipt["policy_document"]["routes"]["surgeon"],
+            {
+                "model": "gpt-5.6-sol",
+                "effort": "high",
+                "sandbox": "workspace-write",
+                "approval_policy": "never",
+            },
+        )
+        self.assertEqual(halted["receipt"]["schema"], CODEX_TIER.SURGEON_SCHEMA)
+        self.assertIsNone(halted["receipt"]["workspace_precondition"])
+        self.assertEqual(
+            late_halt["receipt"]["workspace_precondition"],
+            receipt["workspace_precondition"],
+        )
+
+        receipt_schema = json.loads(
+            (ROOT / "schemas" / "local-dispatch-receipt-v3.schema.json").read_text()
+        )
+        envelope_schema = json.loads(
+            (ROOT / "schemas" / "local-dispatch-envelope-v3.schema.json").read_text()
+        )
+        expanded = expand_envelope_schema(envelope_schema, receipt_schema)
+        self.assertEqual(validate_local_schema(passed, expanded), [])
+        self.assertEqual(validate_local_schema(halted, expanded), [])
+        self.assertEqual(validate_local_schema(late_halt, expanded), [])
+
+        env = {**os.environ, "CODEX_HOME": str(self.home)}
+        for envelope in (passed, halted, late_halt):
+            checked = subprocess.run(
+                [str(self.launcher), "receipt-check"],
+                input=json.dumps(envelope),
+                text=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                env=env,
+                check=False,
+            )
+            self.assertEqual(checked.returncode, 0, checked.stdout + checked.stderr)
+
+        invalid = json.loads(json.dumps(passed))
+        invalid["receipt"]["workspace_precondition"] = None
+        self.assertTrue(validate_local_schema(invalid, expanded))
+        checked = subprocess.run(
+            [str(self.launcher), "receipt-check"],
+            input=json.dumps(invalid),
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            env=env,
+            check=False,
+        )
+        self.assertEqual(checked.returncode, 2)
+
+        invalid = json.loads(json.dumps(passed))
+        surgeon = invalid["receipt"]["policy_document"]["routes"]["surgeon"]
+        surgeon["model"] = "gpt-owner-choice"
+        invalid["receipt"]["requested"]["model"] = "gpt-owner-choice"
+        invalid["receipt"]["observed"]["model"] = "gpt-owner-choice"
+        invalid["receipt"]["policy_sha256"] = hashlib.sha256(
+            json.dumps(
+                invalid["receipt"]["policy_document"],
+                sort_keys=True,
+                separators=(",", ":"),
+            ).encode()
+        ).hexdigest()
+        checked = subprocess.run(
+            [str(self.launcher), "receipt-check"],
+            input=json.dumps(invalid),
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            env=env,
+            check=False,
+        )
+        self.assertEqual(checked.returncode, 2)
+
+    def test_surgeon_custom_v2_policy_preserves_v1_input_hash(self) -> None:
+        policy = self.write_policy(overrides={"scout": ("gpt-owner-choice", "max")})
+        expected_input_hash = hashlib.sha256(policy.read_bytes()).hexdigest()
+        _, linked = self.linked_worktree()
+        result = self.run_dispatch(route="surgeon", workdir=linked)
+        receipt = self.envelope(result)["receipt"]
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertEqual(receipt["policy_kind"], "custom")
+        self.assertEqual(receipt["policy_id"], CODEX_TIER.CUSTOM_POLICY_V2_ID)
+        self.assertEqual(receipt["policy_input_sha256"], expected_input_hash)
+        self.assertEqual(
+            receipt["policy_document"]["routes"]["scout"]["model"],
+            "gpt-owner-choice",
+        )
+        self.assertEqual(
+            receipt["policy_document"]["routes"]["surgeon"]["model"],
+            "gpt-5.6-sol",
+        )
+
+    def test_surgeon_accepts_sha256_linked_worktree_head(self) -> None:
+        _, linked = self.linked_worktree(object_format="sha256")
+        result = self.run_dispatch(route="surgeon", workdir=linked)
+        receipt = self.envelope(result)["receipt"]
+
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertRegex(
+            receipt["workspace_precondition"]["starting_head"], r"^[0-9a-f]{64}$"
+        )
+
+    def test_surgeon_rejects_active_clean_filter_without_executing_it(self) -> None:
+        for driver in ("tripwire", "unspecified", "unset"):
+            with self.subTest(driver=driver):
+                _, linked = self.linked_worktree()
+                attributes = linked / ".gitattributes"
+                attributes.write_text(
+                    f"tracked.txt filter={driver}\n", encoding="utf-8"
+                )
+                self.git("-C", str(linked), "add", ".gitattributes")
+                self.git(
+                    "-C",
+                    str(linked),
+                    "-c",
+                    "user.name=Test",
+                    "-c",
+                    "user.email=fixture",
+                    "-c",
+                    "core.hooksPath=/dev/null",
+                    "commit",
+                    "-qm",
+                    "attributes",
+                )
+
+                marker = self.base / f"clean-filter-{driver}-ran"
+                filter_script = self.base / f"clean-filter-{driver}.sh"
+                filter_script.write_text(
+                    f"#!/bin/sh\ncat\nprintf ran > {shlex.quote(str(marker))}\n",
+                    encoding="utf-8",
+                )
+                filter_script.chmod(0o700)
+                self.git(
+                    "-C",
+                    str(linked),
+                    "config",
+                    f"filter.{driver}.clean",
+                    shlex.quote(str(filter_script)),
+                )
+
+                result = self.run_dispatch(route="surgeon", workdir=linked)
+                receipt = self.envelope(result)["receipt"]
+                self.assertEqual(result.returncode, 2)
+                self.assertIn("Git filter attributes", receipt["error"])
+                self.assertFalse(marker.exists())
+
     def test_receipt_check_verifies_critical_semantics_offline(self) -> None:
         passed = self.envelope(self.run_dispatch())
         halted = self.envelope(self.run_dispatch(mode="wrong_model"))
@@ -2260,6 +2604,30 @@ class DispatcherTests(unittest.TestCase):
                 self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
                 self.assertEqual(payload["status"], "pass")
                 self.assertEqual(payload["check"], "critical_semantics")
+
+        retained = json.loads(json.dumps(passed))
+        retained["receipt"]["policy_document"]["routes"]["scout"]["model"] = (
+            "gpt-5.6-luna"
+        )
+        retained["receipt"]["requested"]["model"] = "gpt-5.6-luna"
+        retained["receipt"]["observed"]["model"] = "gpt-5.6-luna"
+        retained["receipt"]["policy_sha256"] = hashlib.sha256(
+            json.dumps(
+                retained["receipt"]["policy_document"],
+                sort_keys=True,
+                separators=(",", ":"),
+            ).encode()
+        ).hexdigest()
+        result = subprocess.run(
+            [str(self.launcher), "receipt-check"],
+            input=json.dumps(retained),
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            env=env,
+            check=False,
+        )
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         self.assertFalse((self.home / "argv.json").exists())
 
         mutations = (
@@ -2584,8 +2952,6 @@ class DispatcherTests(unittest.TestCase):
                     argv_record.unlink()
                 result = self.run_dispatch(
                     prompt_file=path,
-                    # macOS path-trust checks can exceed one second before the
-                    # dispatcher rejects the FIFO without opening it.
                     harness_timeout=5 if path == fifo else 15,
                 )
                 self.assertEqual(result.returncode, 2)
@@ -2659,6 +3025,238 @@ class DispatcherTests(unittest.TestCase):
         self.assertEqual(result.returncode, 2)
         self.assertIn("concurrency cap", receipt["error"])
         self.assertFalse((self.home / "argv.json").exists())
+
+    def test_workspace_writer_lock_stops_same_workdir_before_model_call(self) -> None:
+        lock_path = self.writer_lock_path(self.workdir)
+        lock_path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+        lock_path.parent.chmod(0o700)
+        with lock_path.open("a+") as handle:
+            fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+            result = self.run_dispatch(route="builder")
+            fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+        receipt = self.envelope(result)["receipt"]
+        self.assertEqual(result.returncode, 2)
+        self.assertIn("workspace writer lock", receipt["error"])
+        self.assertFalse((self.home / "argv.json").exists())
+
+    def test_surgeon_worktree_preconditions_halt_before_model_call(self) -> None:
+        cases: list[tuple[str, Path, str]] = []
+
+        primary, _ = self.linked_worktree()
+        cases.append(("primary", primary, "linked Git worktree"))
+
+        _, tracked_dirty = self.linked_worktree()
+        (tracked_dirty / "tracked.txt").write_text("dirty\n", encoding="utf-8")
+        cases.append(("tracked dirty", tracked_dirty, "must be clean"))
+
+        _, untracked_dirty = self.linked_worktree()
+        (untracked_dirty / "untracked.txt").write_text("dirty\n", encoding="utf-8")
+        cases.append(("untracked dirty", untracked_dirty, "must be clean"))
+
+        _, no_head = self.linked_worktree()
+        self.git(
+            "-C",
+            str(no_head),
+            "symbolic-ref",
+            "HEAD",
+            f"refs/heads/missing-{uuid.uuid4().hex}",
+        )
+        cases.append(("no HEAD", no_head, "valid HEAD"))
+
+        _, submodule = self.linked_worktree()
+        head = self.git("-C", str(submodule), "rev-parse", "HEAD")
+        self.git(
+            "-C",
+            str(submodule),
+            "update-index",
+            "--add",
+            "--cacheinfo",
+            f"160000,{head},nested-repository",
+        )
+        self.git(
+            "-C",
+            str(submodule),
+            "-c",
+            "user.name=Test",
+            "-c",
+            "user.email=fixture",
+            "-c",
+            "core.hooksPath=/dev/null",
+            "commit",
+            "-qm",
+            "gitlink",
+        )
+        cases.append(("submodule", submodule, "submodules"))
+
+        _, linked = self.linked_worktree()
+        nested = linked / "nested"
+        nested.mkdir()
+        cases.append(("non-root", nested, "worktree root"))
+
+        for label, workdir, marker in cases:
+            with self.subTest(case=label):
+                (self.home / "argv.json").unlink(missing_ok=True)
+                result = self.run_dispatch(route="surgeon", workdir=workdir)
+                receipt = self.envelope(result)["receipt"]
+                self.assertEqual(result.returncode, 2)
+                self.assertIn(marker, receipt["error"])
+                self.assertIsNone(receipt["workspace_precondition"])
+                self.assertFalse((self.home / "argv.json").exists())
+                with CODEX_TIER.WorkspaceWriterLock(self.home, workdir):
+                    pass
+
+    def test_surgeon_writer_lock_precedes_worktree_preflight(self) -> None:
+        _, linked = self.linked_worktree()
+        (linked / "untracked.txt").write_text("dirty\n", encoding="utf-8")
+        lock_path = self.writer_lock_path(linked)
+        lock_path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+        lock_path.parent.chmod(0o700)
+        with lock_path.open("a+") as handle:
+            fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+            result = self.run_dispatch(route="surgeon", workdir=linked)
+            fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+        receipt = self.envelope(result)["receipt"]
+        self.assertEqual(result.returncode, 2)
+        self.assertIn("workspace writer lock", receipt["error"])
+        self.assertNotIn("must be clean", receipt["error"])
+        self.assertIsNone(receipt["workspace_precondition"])
+        self.assertFalse((self.home / "argv.json").exists())
+
+    def test_workspace_writer_lock_alias_stops_before_model_call(self) -> None:
+        alias = self.base / "work-alias"
+        alias.symlink_to(self.workdir, target_is_directory=True)
+        lock_path = self.writer_lock_path(self.workdir)
+        lock_path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+        lock_path.parent.chmod(0o700)
+        with lock_path.open("a+") as handle:
+            fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+            result = self.run_dispatch(route="builder", workdir=alias)
+            fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+        receipt = self.envelope(result)["receipt"]
+        self.assertEqual(result.returncode, 2)
+        self.assertIn("workspace writer lock", receipt["error"])
+        self.assertFalse((self.home / "argv.json").exists())
+
+    def test_workspace_writer_lock_allows_other_workdir_and_read_only_route(
+        self,
+    ) -> None:
+        lock_path = self.writer_lock_path(self.workdir)
+        lock_path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+        lock_path.parent.chmod(0o700)
+        other_workdir = self.base / "other-work"
+        other_workdir.mkdir()
+        with lock_path.open("a+") as handle:
+            fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+            self.assertEqual(
+                self.run_dispatch(route="builder", workdir=other_workdir).returncode, 0
+            )
+            self.assertEqual(self.run_dispatch(route="scout").returncode, 0)
+            fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+
+    def test_workspace_writer_lock_releases_after_dispatch_failure(self) -> None:
+        failed = self.run_dispatch(route="builder", mode="nonzero")
+        self.assertEqual(failed.returncode, 2)
+        self.assertEqual(self.run_dispatch(route="builder").returncode, 0)
+
+    def test_workspace_writer_lock_releases_for_in_process_reacquire(self) -> None:
+        with CODEX_TIER.WorkspaceWriterLock(self.home, self.workdir):
+            with self.assertRaisesRegex(CODEX_TIER.DispatchHalt, "already held"):
+                with CODEX_TIER.WorkspaceWriterLock(self.home, self.workdir):
+                    pass
+        with CODEX_TIER.WorkspaceWriterLock(self.home, self.workdir):
+            pass
+
+    def test_workspace_writer_lock_is_shared_across_codex_homes(self) -> None:
+        other_home = self.base / "other-codex-home"
+        other_home.mkdir(mode=0o700)
+        holder = CODEX_TIER.WorkspaceWriterLock(other_home, self.workdir)
+        contender = CODEX_TIER.WorkspaceWriterLock(self.home, self.workdir)
+        self.assertEqual(holder._path, contender._path)
+        with holder:
+            result = self.run_dispatch(route="builder")
+        receipt = self.envelope(result)["receipt"]
+        self.assertEqual(result.returncode, 2)
+        self.assertIn("workspace writer lock", receipt["error"])
+        self.assertFalse((self.home / "argv.json").exists())
+
+    def test_workspace_writer_lock_rejects_unsafe_shared_state(self) -> None:
+        target = self.base / "lock-target"
+        target.mkdir(mode=0o700)
+        linked = self.base / "linked-lock-directory"
+        linked.symlink_to(target, target_is_directory=True)
+        with (
+            mock.patch.object(
+                CODEX_TIER, "workspace_writer_lock_dir", return_value=linked
+            ),
+            self.assertRaisesRegex(CODEX_TIER.DispatchHalt, "symlinked"),
+        ):
+            with CODEX_TIER.WorkspaceWriterLock(self.home, self.workdir):
+                pass
+
+        permissive = self.base / "permissive-lock-directory"
+        permissive.mkdir(mode=0o700)
+        permissive.chmod(0o755)
+        with (
+            mock.patch.object(
+                CODEX_TIER, "workspace_writer_lock_dir", return_value=permissive
+            ),
+            self.assertRaisesRegex(CODEX_TIER.DispatchHalt, "mode 0700"),
+        ):
+            with CODEX_TIER.WorkspaceWriterLock(self.home, self.workdir):
+                pass
+
+        special = self.base / "special-lock-directory"
+        special.mkdir(mode=0o700)
+        with mock.patch.object(
+            CODEX_TIER, "workspace_writer_lock_dir", return_value=special
+        ):
+            lock = CODEX_TIER.WorkspaceWriterLock(self.home, self.workdir)
+            os.mkfifo(lock._path, mode=0o600)
+            with self.assertRaisesRegex(CODEX_TIER.DispatchHalt, "regular file"):
+                with lock:
+                    pass
+
+    def test_workspace_writer_lock_converts_setup_errors(self) -> None:
+        missing = self.base / "missing-workdir"
+        with self.assertRaisesRegex(CODEX_TIER.DispatchHalt, "writer lock workdir"):
+            CODEX_TIER.WorkspaceWriterLock(self.home, missing)
+
+        lock = CODEX_TIER.WorkspaceWriterLock(self.home, self.workdir)
+        real_open = os.open
+        real_close = os.close
+        descriptors: list[int] = []
+
+        def recording_open(*args: object, **kwargs: object) -> int:
+            descriptor = real_open(*args, **kwargs)  # type: ignore[arg-type]
+            descriptors.append(descriptor)
+            return descriptor
+
+        with (
+            mock.patch.object(CODEX_TIER.os, "open", side_effect=recording_open),
+            mock.patch.object(
+                CODEX_TIER.os, "fdopen", side_effect=OSError("synthetic fdopen failure")
+            ),
+            mock.patch.object(CODEX_TIER.os, "close", wraps=real_close) as close,
+            self.assertRaisesRegex(CODEX_TIER.DispatchHalt, "open writer lock handle"),
+        ):
+            lock.__enter__()
+        self.assertEqual(len(descriptors), 1)
+        close.assert_any_call(descriptors[0])
+        with self.assertRaises(OSError):
+            os.fstat(descriptors[0])
+
+        lock_dir = self.base / "collision-lock-directory"
+        lock_dir.write_text("collision", encoding="utf-8")
+        with (
+            mock.patch.object(
+                CODEX_TIER, "workspace_writer_lock_dir", return_value=lock_dir
+            ),
+            self.assertRaisesRegex(
+                CODEX_TIER.DispatchHalt, "workspace writer lock directory"
+            ),
+        ):
+            with CODEX_TIER.WorkspaceWriterLock(self.home, self.workdir):
+                pass
 
     def test_tampered_ledger_stops_before_model_call(self) -> None:
         first = self.run_dispatch()

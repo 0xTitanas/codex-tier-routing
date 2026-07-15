@@ -3,7 +3,7 @@
 ## Supported versions
 
 Security fixes are made on the current `main` branch. The supported prerelease
-line is `v1.0.0-rc.2`. Compatibility is limited to the versions and platforms
+line is `v1.1.0-rc.1`. Compatibility is limited to the versions and platforms
 listed in [docs/compatibility.md](docs/compatibility.md).
 
 ## Reporting a vulnerability
@@ -72,7 +72,8 @@ their complete path before use but does not change their permissions.
 
 An optional custom policy is accepted only at the fixed owner-only
 `tier-routing/policy.toml` path. It may configure model and effort for exactly
-five routes; it cannot configure sandbox, network, approval, tools, commands,
+five stable routes; the experimental `surgeon` tuple is fixed. It cannot
+configure sandbox, network, approval, tools, commands,
 environment, or concurrency. The parser bounds file size and identifier syntax,
 rejects unknown fields and unsafe paths, and rechecks the source after the child
 returns. Receipts embed the effective policy and bind its canonical and input
@@ -81,8 +82,14 @@ builtin policy, it covers the canonical default selection. Policy validation doe
 access; operators must use a bounded canary.
 
 Workspace-write routes can modify the selected workspace before a later receipt
-failure is detected. Use a clean worktree, inspect effects after ambiguous
-outcomes, and do not retry until state has been reconciled.
+failure is detected. Write routes are mutually exclusive per resolved workdir;
+concurrent writes to the same workdir are rejected. The experimental `surgeon`
+route additionally enforces a clean linked Git worktree root and valid starting
+HEAD. Its preflight rejects submodules and any Git `filter` attributes rather
+than risk invoking repository-configured helper processes outside the Codex
+sandbox. Operators must provide explicit completion criteria and parent review
+before integration. Inspect effects after ambiguous outcomes, and do not retry
+until state has been reconciled.
 
 The dispatcher forces workspace network access off and additional writable
 roots empty through command-line configuration, then verifies that the

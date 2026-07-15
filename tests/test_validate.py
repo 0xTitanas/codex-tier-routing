@@ -41,11 +41,13 @@ class ValidateTests(unittest.TestCase):
         posix_home = chr(47).join(("", "Users", "sample", "project"))
         windows_home = chr(92).join(("C:", "Users", "sample", "project"))
         private_ip = ".".join(("192", "168", "1", "25"))
+        lab_host = "linux" + "-lab"
 
         self.assertEqual(classify(unsafe_email), ("unapproved email address",))
         self.assertEqual(classify(posix_home), ("personal home path",))
         self.assertEqual(classify(windows_home), ("personal home path",))
         self.assertEqual(classify(private_ip), ("private network address",))
+        self.assertEqual(classify(lab_host), ("local lab hostname",))
 
     def test_public_privacy_allows_documentation_values(self) -> None:
         classify = VALIDATE["public_privacy_categories"]
@@ -110,6 +112,16 @@ class ValidateTests(unittest.TestCase):
             with contextlib.redirect_stdout(output):
                 self.assertEqual(check(root), 1)
         self.assertNotIn(unsafe_email, output.getvalue())
+
+    def test_public_privacy_rejects_live_and_dangling_symlinks(self) -> None:
+        check = VALIDATE["check_public_privacy"]
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            (root / "target").write_text("safe", encoding="utf-8")
+            (root / "live-link").symlink_to("target")
+            (root / "dangling-link").symlink_to("missing")
+            with contextlib.redirect_stdout(io.StringIO()):
+                self.assertEqual(check(root), 2)
 
     def test_ci_contract_rejects_reduced_and_inert_workflows(self) -> None:
         check = VALIDATE["check_ci_contract"]

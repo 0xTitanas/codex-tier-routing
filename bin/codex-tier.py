@@ -10,6 +10,9 @@ Worker output is returned as untrusted data and never supplies attestation.
 from __future__ import annotations
 
 import argparse
+import copy
+from contextlib import nullcontext
+import difflib
 import fcntl
 import hashlib
 import json
@@ -33,15 +36,20 @@ from typing import Any
 
 
 SCHEMA = "codex-tier-routing/local-dispatch-receipt/v2"
+SURGEON_SCHEMA = "codex-tier-routing/local-dispatch-receipt/v3"
 POLICY_SCHEMA = "codex-tier-routing/policy/v1"
-PROJECT_VERSION = "1.0.0-rc.2"
+POLICY_V2_SCHEMA = "codex-tier-routing/policy/v2"
+PROJECT_VERSION = "1.1.0-rc.1"
 DEFAULT_POLICY_ID = "default-v1"
 CUSTOM_POLICY_ID = "custom-v1"
+DEFAULT_POLICY_V2_ID = "default-v2"
+CUSTOM_POLICY_V2_ID = "custom-v2"
 MAX_POLICY_BYTES = 64 * 1024
 MAX_RECEIPT_CHECK_BYTES = 2 * 1024 * 1024
 ACCEPTED_EFFORTS = ("none", "low", "medium", "high", "xhigh", "max")
 MODEL_ID_PATTERN = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}\Z")
 SHA256_PATTERN = re.compile(r"[0-9a-f]{64}\Z")
+GIT_OBJECT_ID_PATTERN = re.compile(r"(?:[0-9a-f]{40}|[0-9a-f]{64})\Z")
 LEDGER_REF_PATTERN = re.compile(r"local-ledger://[0-9a-f]{64}\Z")
 MODEL_CATALOG_URL = "https://developers.openai.com/api/docs/models"
 MAX_PROMPT_BYTES = 256 * 1024
@@ -98,12 +106,13 @@ class CodexLaunch:
 
 
 ROUTES: dict[str, Route] = {
-    "scout": Route("gpt-5.6-luna", "low", "read-only"),
+    "scout": Route("gpt-5.6-terra", "low", "read-only"),
     "grunt": Route("gpt-5.6-luna", "low", "workspace-write"),
     "builder": Route("gpt-5.6-terra", "medium", "workspace-write"),
-    "reviewer": Route("gpt-5.6-terra", "high", "read-only"),
+    "reviewer": Route("gpt-5.6-sol", "high", "read-only"),
     "architect": Route("gpt-5.6-sol", "xhigh", "read-only"),
 }
+SURGEON_ROUTE = Route("gpt-5.6-sol", "high", "workspace-write")
 
 RECEIPT_FIELDS = {
     "schema",
@@ -137,6 +146,7 @@ RECEIPT_FIELDS = {
     "rollout_sha256",
     "error",
 }
+SURGEON_RECEIPT_FIELDS = RECEIPT_FIELDS | {"workspace_precondition"}
 
 
 def policy_payload(policy_id: str, routes: dict[str, Route]) -> dict[str, Any]:
@@ -151,10 +161,13 @@ def policy_payload(policy_id: str, routes: dict[str, Route]) -> dict[str, Any]:
 
 
 def effective_policy_document(
-    policy_id: str, routes: dict[str, Route]
+    policy_id: str,
+    routes: dict[str, Route],
+    *,
+    schema: str = POLICY_SCHEMA,
 ) -> dict[str, Any]:
     return {
-        "schema": POLICY_SCHEMA,
+        "schema": schema,
         "policy_id": policy_id,
         "routes": {
             name: {
@@ -178,6 +191,22 @@ def default_policy() -> RoutingPolicy:
         input_sha256=sha256_bytes(canonical_json(source)),
         document=document,
         routes=dict(ROUTES),
+    )
+
+
+def surgeon_policy(policy: RoutingPolicy) -> RoutingPolicy:
+    routes = {**policy.routes, "surgeon": SURGEON_ROUTE}
+    policy_id = (
+        DEFAULT_POLICY_V2_ID if policy.kind == "builtin" else CUSTOM_POLICY_V2_ID
+    )
+    document = effective_policy_document(policy_id, routes, schema=POLICY_V2_SCHEMA)
+    return RoutingPolicy(
+        kind=policy.kind,
+        policy_id=policy_id,
+        sha256=sha256_bytes(canonical_json(document)),
+        input_sha256=policy.input_sha256,
+        document=document,
+        routes=routes,
     )
 
 
@@ -857,6 +886,146 @@ def strict_candidate(original: bytes) -> bytes:
     return candidate
 
 
+def strict_toml(raw: bytes) -> dict[str, Any]:
+    try:
+        value = tomllib.loads(raw.decode("utf-8"))
+    except (UnicodeDecodeError, tomllib.TOMLDecodeError) as exc:
+        raise DispatchHalt("managed strict configuration has drifted") from exc
+    if not isinstance(value, dict):
+        raise DispatchHalt("managed strict configuration has drifted")
+    return value
+
+
+def additive_line_mapping(base: bytes, current: bytes) -> list[int] | None:
+    """Map unchanged base lines into a version containing line-only additions."""
+    base_lines = base.splitlines(keepends=True)
+    current_lines = current.splitlines(keepends=True)
+    mapping: list[int] = []
+    cursor = 0
+    for base_index, line in enumerate(base_lines):
+        while cursor < len(current_lines) and current_lines[cursor] != line:
+            final_unterminated_line = (
+                base_index == len(base_lines) - 1
+                and not line.endswith((b"\n", b"\r"))
+                and current_lines[cursor].rstrip(b"\r\n") == line
+            )
+            if final_unterminated_line:
+                break
+            cursor += 1
+        if cursor == len(current_lines):
+            return None
+        mapping.append(cursor)
+        cursor += 1
+    return mapping
+
+
+def strict_candidate_is_intact(candidate: bytes, current: bytes) -> bool:
+    try:
+        parsed = strict_toml(current)
+    except DispatchHalt:
+        return False
+    features = parsed.get("features")
+    return (
+        additive_line_mapping(candidate, current) is not None
+        and isinstance(features, dict)
+        and features.get("multi_agent") is False
+    )
+
+
+def strict_target_matches(original: bytes, current: bytes) -> bool:
+    """Recognize an already-restored config plus unrelated line additions."""
+    if additive_line_mapping(original, current) is None:
+        return False
+    try:
+        original_value = strict_toml(original)
+        current_value = strict_toml(current)
+    except DispatchHalt:
+        return False
+    original_features = original_value.get("features")
+    current_features = current_value.get("features")
+    original_has_target = isinstance(original_features, dict) and (
+        "multi_agent" in original_features
+    )
+    current_has_target = isinstance(current_features, dict) and (
+        "multi_agent" in current_features
+    )
+    if original_has_target:
+        return current_has_target and (
+            current_features["multi_agent"] == original_features["multi_agent"]
+        )
+    return not current_has_target
+
+
+def restore_strict_additions(
+    original: bytes, candidate: bytes, current: bytes
+) -> bytes:
+    """Reverse the one managed line edit while preserving additive TOML drift."""
+    original_lines = original.splitlines(keepends=True)
+    candidate_lines = candidate.splitlines(keepends=True)
+    current_lines = current.splitlines(keepends=True)
+    mapping = additive_line_mapping(candidate, current)
+    changes = [
+        opcode
+        for opcode in difflib.SequenceMatcher(
+            a=original_lines, b=candidate_lines, autojunk=False
+        ).get_opcodes()
+        if opcode[0] != "equal"
+    ]
+    if mapping is None or len(changes) != 1:
+        raise DispatchHalt(
+            "managed strict configuration has drifted; refusing to overwrite it"
+        )
+    _, original_start, original_end, candidate_start, candidate_end = changes[0]
+    if candidate_start == candidate_end:
+        raise DispatchHalt("strict configuration recovery delta is invalid")
+    positions = mapping[candidate_start:candidate_end]
+    if positions != list(range(positions[0], positions[0] + len(positions))):
+        raise DispatchHalt(
+            "managed strict configuration has drifted; refusing to overwrite it"
+        )
+    replacement = list(original_lines[original_start:original_end])
+    managed_ending = current_lines[positions[-1]][
+        len(current_lines[positions[-1]].rstrip(b"\r\n")) :
+    ]
+    if replacement and managed_ending and not replacement[-1].endswith((b"\n", b"\r")):
+        replacement[-1] += managed_ending
+    restored_lines = (
+        current_lines[: positions[0]] + replacement + current_lines[positions[-1] + 1 :]
+    )
+    restored = b"".join(restored_lines)
+    current_value = strict_toml(current)
+    original_value = strict_toml(original)
+    expected = copy.deepcopy(current_value)
+    original_features = original_value.get("features")
+    expected_features = expected.get("features")
+    if isinstance(original_features, dict) and "multi_agent" in original_features:
+        if not isinstance(expected_features, dict):
+            raise DispatchHalt("managed strict configuration has drifted")
+        expected_features["multi_agent"] = original_features["multi_agent"]
+    elif isinstance(expected_features, dict):
+        expected_features.pop("multi_agent", None)
+        if not expected_features and "features" not in original_value:
+            expected.pop("features")
+    if strict_toml(restored) != expected:
+        raise DispatchHalt(
+            "managed strict configuration has drifted; refusing to overwrite it"
+        )
+    return restored
+
+
+def strict_managed_versions(
+    manifest: dict[str, Any], backup: Path
+) -> tuple[bytes, bytes]:
+    current_owner_regular(backup, label="strict-mode backup")
+    original = backup.read_bytes()
+    if sha256_bytes(original) != manifest["before_sha256"]:
+        raise DispatchHalt("strict-mode backup hash mismatch")
+    candidate = strict_candidate(original)
+    if sha256_bytes(candidate) != manifest["after_sha256"]:
+        raise DispatchHalt("strict-mode managed candidate hash mismatch")
+    return original, candidate
+
+
 def read_strict_manifest(path: Path) -> dict[str, Any] | None:
     if not path.exists():
         return None
@@ -898,11 +1067,13 @@ def strict_enable(_: argparse.Namespace, home: Path | None = None) -> int:
         if manifest["state"] == "disabling":
             strict_disable(_, home)
             return strict_enable(_, home)
+        _, managed = strict_managed_versions(manifest, backup)
         if config.exists():
             current_owner_regular(config, label="config.toml")
         current = config.read_bytes() if config.exists() else b""
         current_hash = sha256_bytes(current)
-        if manifest["state"] == "pending" and current_hash == manifest["after_sha256"]:
+        managed_is_intact = strict_candidate_is_intact(managed, current)
+        if manifest["state"] == "pending" and managed_is_intact:
             if native_multi_agent_enabled(executable, home):
                 raise DispatchHalt("pending strict configuration is not effective")
             manifest["state"] = "active"
@@ -913,7 +1084,7 @@ def strict_enable(_: argparse.Namespace, home: Path | None = None) -> int:
             manifest_path.unlink()
             backup.unlink()
             return strict_enable(_, home)
-        elif current_hash != manifest["after_sha256"]:
+        elif not managed_is_intact:
             raise DispatchHalt("managed strict configuration has drifted")
         if native_multi_agent_enabled(executable, home):
             raise DispatchHalt("managed strict configuration is not effective")
@@ -1043,32 +1214,57 @@ def strict_disable(_: argparse.Namespace, home: Path | None = None) -> int:
             json.dumps({"status": "pass", "strict_mode": "not_managed"}, sort_keys=True)
         )
         return 0
-    current_owner_regular(backup, label="strict-mode backup")
-    original = backup.read_bytes()
-    if sha256_bytes(original) != manifest["before_sha256"]:
-        raise DispatchHalt("strict-mode backup hash mismatch")
+    original, managed = strict_managed_versions(manifest, backup)
     if config.is_symlink():
         raise DispatchHalt("refusing symlinked config.toml")
     if config.exists():
-        current_owner_regular(config, label="config.toml")
+        current_details = current_owner_regular(config, label="config.toml")
+        current_mode = stat.S_IMODE(current_details.st_mode)
+    else:
+        current_mode = 0o600
     current = config.read_bytes() if config.exists() else b""
-    current_hash = sha256_bytes(current)
     if manifest["state"] == "active":
-        if current_hash != manifest["after_sha256"]:
+        if not strict_candidate_is_intact(managed, current):
             raise DispatchHalt(
                 "managed strict configuration has drifted; refusing to overwrite it"
             )
         manifest["state"] = "disabling"
         atomic_write(manifest_path, canonical_json(manifest) + b"\n", 0o600)
-    elif current_hash not in {manifest["after_sha256"], manifest["before_sha256"]}:
+    elif not (
+        strict_candidate_is_intact(managed, current)
+        or strict_target_matches(original, current)
+    ):
         raise DispatchHalt(
             "managed strict configuration has drifted; refusing to overwrite it"
         )
-    if current_hash != manifest["before_sha256"]:
-        if manifest["before_exists"]:
-            atomic_write(config, original, manifest["before_mode"])
+
+    # Re-read after recording the disabling state so changes already visible at
+    # this recovery boundary are preserved or rejected.
+    if config.is_symlink():
+        raise DispatchHalt("refusing symlinked config.toml")
+    if config.exists():
+        current_details = current_owner_regular(config, label="config.toml")
+        current_mode = stat.S_IMODE(current_details.st_mode)
+    current = config.read_bytes() if config.exists() else b""
+    if strict_candidate_is_intact(managed, current):
+        restored = restore_strict_additions(original, managed, current)
+    elif strict_target_matches(original, current):
+        restored = current
+    else:
+        raise DispatchHalt(
+            "managed strict configuration has drifted; refusing to overwrite it"
+        )
+    if restored != current:
+        if restored or manifest["before_exists"]:
+            mode = (
+                manifest["before_mode"] if manifest["before_exists"] else current_mode
+            )
+            atomic_write(config, restored, mode)
         else:
-            config.unlink()
+            try:
+                config.unlink()
+            except FileNotFoundError:
+                pass
     manifest_path.unlink()
     backup.unlink()
     print(
@@ -1113,6 +1309,101 @@ class Slot:
         if self._file is not None:
             fcntl.flock(self._file.fileno(), fcntl.LOCK_UN)
             self._file.close()
+
+
+def workspace_writer_lock_dir() -> Path:
+    """Return the environment-independent lock namespace for this OS identity."""
+    return Path("/tmp") / f"codex-tier-routing-{os.geteuid()}-locks"
+
+
+class WorkspaceWriterLock:
+    """Per-workdir exclusive writer lock using the resolved directory identity."""
+
+    def __init__(self, home: Path, workdir: Path):
+        self._dir = workspace_writer_lock_dir()
+        try:
+            details = workdir.stat()
+        except OSError as exc:
+            raise DispatchHalt(
+                f"unable to inspect writer lock workdir safely: {type(exc).__name__}"
+            ) from exc
+        self._path = (
+            self._dir / f"workspace-write-{details.st_dev}-{details.st_ino}.lock"
+        )
+        self._file = None
+
+    def __enter__(self) -> "WorkspaceWriterLock":
+        try:
+            try:
+                self._dir.mkdir(mode=0o700)
+            except FileExistsError:
+                pass
+            private_existing_dir(self._dir, label="workspace writer lock directory")
+        except DispatchHalt:
+            raise
+        except OSError as exc:
+            raise DispatchHalt(
+                "unable to prepare workspace writer lock directory safely: "
+                f"{type(exc).__name__}"
+            ) from exc
+        flags = os.O_RDWR | os.O_CREAT | os.O_NONBLOCK | getattr(os, "O_NOFOLLOW", 0)
+        try:
+            descriptor = os.open(self._path, flags, 0o600)
+        except OSError as exc:
+            raise DispatchHalt(
+                f"unable to open workspace writer lock safely: {type(exc).__name__}"
+            ) from exc
+        try:
+            details = os.fstat(descriptor)
+            if (
+                not stat.S_ISREG(details.st_mode)
+                or details.st_uid != os.geteuid()
+                or details.st_nlink != 1
+                or stat.S_IMODE(details.st_mode) & 0o077
+            ):
+                raise DispatchHalt(
+                    "workspace writer lock is not a private current-owner regular file"
+                )
+            os.fchmod(descriptor, 0o600)
+        except DispatchHalt:
+            os.close(descriptor)
+            raise
+        except OSError as exc:
+            os.close(descriptor)
+            raise DispatchHalt(
+                f"unable to inspect workspace writer lock safely: {type(exc).__name__}"
+            ) from exc
+        try:
+            handle = os.fdopen(descriptor, "a+")
+        except OSError as exc:
+            try:
+                os.close(descriptor)
+            except OSError:
+                pass
+            raise DispatchHalt(
+                f"unable to open writer lock handle safely: {type(exc).__name__}"
+            ) from exc
+        try:
+            fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError as exc:
+            handle.close()
+            raise DispatchHalt(
+                "workspace writer lock already held for this workdir"
+            ) from exc
+        except OSError as exc:
+            handle.close()
+            raise DispatchHalt(
+                f"unable to acquire workspace writer lock safely: {type(exc).__name__}"
+            ) from exc
+        self._file = handle
+        return self
+
+    def __exit__(self, *_: object) -> None:
+        if self._file is not None:
+            try:
+                fcntl.flock(self._file.fileno(), fcntl.LOCK_UN)
+            finally:
+                self._file.close()
 
 
 def read_prompt(args: argparse.Namespace) -> str:
@@ -1520,8 +1811,8 @@ def base_receipt(
     launch: CodexLaunch,
 ) -> dict[str, Any]:
     launcher, dispatcher_runtime, interpreter = dispatcher_launch_chain()
-    return {
-        "schema": SCHEMA,
+    receipt = {
+        "schema": SURGEON_SCHEMA if route_name == "surgeon" else SCHEMA,
         "receipt_id": str(uuid.uuid4()),
         "mechanism": "codex-exec-local",
         "claim_class": "dispatcher_configured_and_host_observed",
@@ -1558,10 +1849,27 @@ def base_receipt(
         "rollout_sha256": None,
         "error": None,
     }
+    if route_name == "surgeon":
+        receipt["workspace_precondition"] = None
+    return receipt
 
 
 def verify_policy_binding(receipt: dict[str, Any]) -> None:
     """Verify the self-contained policy/request/observation relationship."""
+    schema = receipt.get("schema")
+    if schema == SCHEMA:
+        policy_schema = POLICY_SCHEMA
+        default_id = DEFAULT_POLICY_ID
+        custom_id = CUSTOM_POLICY_ID
+        fixed_routes = ROUTES
+    elif schema == SURGEON_SCHEMA:
+        policy_schema = POLICY_V2_SCHEMA
+        default_id = DEFAULT_POLICY_V2_ID
+        custom_id = CUSTOM_POLICY_V2_ID
+        fixed_routes = {**ROUTES, "surgeon": SURGEON_ROUTE}
+    else:
+        raise DispatchHalt("receipt schema is unsupported")
+
     document = receipt.get("policy_document")
     if not isinstance(document, dict) or set(document) != {
         "schema",
@@ -1571,14 +1879,14 @@ def verify_policy_binding(receipt: dict[str, Any]) -> None:
         raise DispatchHalt("receipt policy document is unavailable")
     if sha256_bytes(canonical_json(document)) != receipt.get("policy_sha256"):
         raise DispatchHalt("receipt policy document hash mismatch")
-    if document.get("schema") != POLICY_SCHEMA:
+    if document.get("schema") != policy_schema:
         raise DispatchHalt("receipt policy document schema mismatch")
     if document.get("policy_id") != receipt.get("policy_id"):
         raise DispatchHalt("receipt policy identifier mismatch")
     kind = receipt.get("policy_kind")
     if kind not in {"builtin", "custom"}:
         raise DispatchHalt("receipt policy kind is invalid")
-    expected_id = DEFAULT_POLICY_ID if kind == "builtin" else CUSTOM_POLICY_ID
+    expected_id = default_id if kind == "builtin" else custom_id
     if receipt.get("policy_id") != expected_id:
         raise DispatchHalt("receipt policy kind and identifier mismatch")
     if not isinstance(
@@ -1588,10 +1896,12 @@ def verify_policy_binding(receipt: dict[str, Any]) -> None:
     route_name = receipt.get("route_requested")
     if route_name != receipt.get("route_resolved"):
         raise DispatchHalt("receipt route resolution mismatch")
+    if schema == SURGEON_SCHEMA and route_name != "surgeon":
+        raise DispatchHalt("receipt v3 route must be surgeon")
     routes = document.get("routes")
-    if not isinstance(routes, dict) or set(routes) != set(ROUTES):
+    if not isinstance(routes, dict) or set(routes) != set(fixed_routes):
         raise DispatchHalt("receipt policy route set mismatch")
-    for name, fixed in ROUTES.items():
+    for name, fixed in fixed_routes.items():
         selection = routes[name]
         if not isinstance(selection, dict) or set(selection) != {
             "model",
@@ -1610,6 +1920,10 @@ def verify_policy_binding(receipt: dict[str, Any]) -> None:
             raise DispatchHalt(f"receipt policy sandbox mismatch: {name}")
         if selection["approval_policy"] != "never":
             raise DispatchHalt(f"receipt policy approval mismatch: {name}")
+        if name == "surgeon" and (
+            selection["model"] != fixed.model or selection["effort"] != fixed.effort
+        ):
+            raise DispatchHalt("receipt surgeon policy tuple mismatch")
     route = routes.get(route_name) if isinstance(routes, dict) else None
     requested = receipt.get("requested")
     if not isinstance(route, dict) or not isinstance(requested, dict):
@@ -1753,10 +2067,192 @@ def run_codex(
     )
 
 
+def resolve_git() -> Path:
+    executable = shutil.which("git", path=os.environ.get("PATH"))
+    if executable is None or not Path(executable).is_absolute():
+        raise DispatchHalt("Git executable is unavailable")
+    resolved = validate_executable_chain(Path(executable), label="Git executable path")
+    if not resolved.is_file() or not os.access(resolved, os.X_OK):
+        raise DispatchHalt("Git executable is not an executable regular file")
+    return resolved
+
+
+def git_preflight_output(
+    executable: Path,
+    workdir: Path,
+    home: Path,
+    *arguments: str,
+    failure: str,
+    input_bytes: bytes = b"",
+    stdout_limit: int = MAX_CONTROL_STDOUT_BYTES,
+) -> str:
+    result = run_process_bounded(
+        [
+            str(executable),
+            "--no-optional-locks",
+            "-c",
+            "core.fsmonitor=false",
+            "-C",
+            str(workdir),
+            *arguments,
+        ],
+        input_bytes=input_bytes,
+        cwd=workdir,
+        env=child_environment(home),
+        timeout=10,
+        stdout_limit=stdout_limit,
+        stderr_limit=MAX_CONTROL_STDERR_BYTES,
+        operation="surgeon Git preflight",
+    )
+    if result.returncode != 0:
+        raise DispatchHalt(failure)
+    return result.stdout
+
+
+def reject_active_git_filters(executable: Path, workdir: Path, home: Path) -> None:
+    staged = git_preflight_output(
+        executable,
+        workdir,
+        home,
+        "ls-files",
+        "--cached",
+        "--stage",
+        "-z",
+        failure="unable to inspect surgeon Git index",
+        stdout_limit=MAX_DISPATCH_STDOUT_BYTES,
+    )
+    paths: list[str] = []
+    for entry in staged.rstrip("\0").split("\0") if staged else ():
+        metadata, separator, path = entry.partition("\t")
+        fields = metadata.split()
+        if not separator or len(fields) != 3 or not path:
+            raise DispatchHalt("surgeon Git index output is malformed")
+        mode, _, stage = fields
+        if stage != "0":
+            raise DispatchHalt("surgeon worktree must not have unmerged index entries")
+        if mode == "160000":
+            raise DispatchHalt("surgeon worktrees with submodules are not supported")
+        paths.append(path)
+
+    if not paths:
+        return
+    attributes = git_preflight_output(
+        executable,
+        workdir,
+        home,
+        "check-attr",
+        "-z",
+        "--stdin",
+        "--all",
+        failure="unable to inspect surgeon Git filter attributes",
+        input_bytes=("\0".join(paths) + "\0").encode(),
+        stdout_limit=MAX_DISPATCH_STDOUT_BYTES,
+    )
+    fields = attributes.rstrip("\0").split("\0") if attributes else []
+    if len(fields) % 3:
+        raise DispatchHalt("surgeon Git attribute output is malformed")
+    for index in range(0, len(fields), 3):
+        attribute = fields[index + 1]
+        if attribute == "filter":
+            raise DispatchHalt(
+                "surgeon worktree uses Git filter attributes; refusing unsafe status scan"
+            )
+
+
+def surgeon_workspace_precondition(workdir: Path, home: Path) -> dict[str, str]:
+    executable = resolve_git()
+
+    root_raw = git_preflight_output(
+        executable,
+        workdir,
+        home,
+        "rev-parse",
+        "--show-toplevel",
+        failure="surgeon workdir must be the root of a linked Git worktree",
+    ).strip()
+    if not root_raw or "\n" in root_raw:
+        raise DispatchHalt("surgeon workdir must be a Git worktree root")
+    try:
+        root = Path(root_raw).resolve(strict=True)
+    except OSError as exc:
+        raise DispatchHalt("surgeon workdir must be a Git worktree root") from exc
+    if root != workdir:
+        raise DispatchHalt("surgeon workdir must be a Git worktree root")
+
+    git_paths = []
+    for argument in ("--git-dir", "--git-common-dir"):
+        raw = git_preflight_output(
+            executable,
+            workdir,
+            home,
+            "rev-parse",
+            argument,
+            failure="surgeon workdir must be a linked Git worktree",
+        ).strip()
+        if not raw or "\n" in raw:
+            raise DispatchHalt("surgeon workdir must be a linked Git worktree")
+        candidate = Path(raw)
+        try:
+            git_paths.append(
+                (candidate if candidate.is_absolute() else workdir / candidate).resolve(
+                    strict=True
+                )
+            )
+        except OSError as exc:
+            raise DispatchHalt("surgeon workdir must be a linked Git worktree") from exc
+    if git_paths[0] == git_paths[1]:
+        raise DispatchHalt("surgeon workdir must be a linked Git worktree")
+
+    starting_head = git_preflight_output(
+        executable,
+        workdir,
+        home,
+        "rev-parse",
+        "--verify",
+        "HEAD^{commit}",
+        failure="surgeon worktree must have a valid HEAD",
+    ).strip()
+    if GIT_OBJECT_ID_PATTERN.fullmatch(starting_head) is None:
+        raise DispatchHalt("surgeon worktree must have a valid Git HEAD object ID")
+
+    reject_active_git_filters(executable, workdir, home)
+    status = git_preflight_output(
+        executable,
+        workdir,
+        home,
+        "status",
+        "--porcelain=v1",
+        "--untracked-files=all",
+        "--ignore-submodules=all",
+        "--no-renames",
+        failure="unable to inspect surgeon worktree status",
+    )
+    if status:
+        raise DispatchHalt("surgeon worktree must be clean, including untracked files")
+
+    current_head = git_preflight_output(
+        executable,
+        workdir,
+        home,
+        "rev-parse",
+        "--verify",
+        "HEAD^{commit}",
+        failure="surgeon worktree HEAD changed during preflight",
+    ).strip()
+    if current_head != starting_head:
+        raise DispatchHalt("surgeon worktree HEAD changed during preflight")
+    return {
+        "kind": "clean-linked-git-worktree",
+        "starting_head": starting_head,
+    }
+
+
 def dispatch(args: argparse.Namespace, home: Path | None = None) -> int:
     home = resolve_codex_home() if home is None else home
-    policy = load_policy(home)
-    route = policy.routes[args.route]
+    active_policy = load_policy(home)
+    is_surgeon = args.route == "surgeon"
+    receipt_policy = surgeon_policy(active_policy) if is_surgeon else active_policy
+    route = SURGEON_ROUTE if is_surgeon else active_policy.routes[args.route]
     workdir = Path(args.workdir).expanduser().resolve()
     if not workdir.is_dir():
         raise DispatchHalt("workdir must be an existing directory")
@@ -1773,12 +2269,22 @@ def dispatch(args: argparse.Namespace, home: Path | None = None) -> int:
             "Codex did not honor the child native multi-agent disable override"
         )
     preflight_ledger(home)
-    receipt = base_receipt(args.route, route, policy, workdir, launch)
+    receipt = base_receipt(args.route, route, receipt_policy, workdir, launch)
     verify_policy_binding(receipt)
     output = ""
     try:
-        with Slot(home):
-            assert_policy_unchanged(policy, home)
+        writer_lock = (
+            WorkspaceWriterLock(home, workdir)
+            if route.sandbox == "workspace-write"
+            else nullcontext()
+        )
+        with Slot(home), writer_lock:
+            assert_policy_unchanged(active_policy, home)
+            if is_surgeon:
+                receipt["workspace_precondition"] = surgeon_workspace_precondition(
+                    workdir, home
+                )
+                verify_policy_binding(receipt)
             dispatch_started_ns = time.time_ns()
             command = launch.command(
                 "-a",
@@ -1810,7 +2316,7 @@ def dispatch(args: argparse.Namespace, home: Path | None = None) -> int:
             except DispatchHalt as exc:
                 dispatch_error = exc
                 result = None
-            assert_policy_unchanged(policy, home)
+            assert_policy_unchanged(active_policy, home)
             if dispatch_error is not None:
                 raise dispatch_error
             assert result is not None
@@ -1897,6 +2403,14 @@ def probe(_: argparse.Namespace, home: Path | None = None) -> int:
                 }
                 for name, value in policy.routes.items()
             },
+            "experimental_routes": {
+                "surgeon": {
+                    "model": SURGEON_ROUTE.model,
+                    "effort": SURGEON_ROUTE.effort,
+                    "sandbox": SURGEON_ROUTE.sandbox,
+                    "configurable": False,
+                }
+            },
         }
         if native_enabled:
             payload["error"] = (
@@ -1949,6 +2463,14 @@ def policy_check(_: argparse.Namespace, home: Path | None = None) -> int:
                         "sandbox": route.sandbox,
                     }
                     for name, route in policy.routes.items()
+                },
+                "experimental_routes": {
+                    "surgeon": {
+                        "model": SURGEON_ROUTE.model,
+                        "effort": SURGEON_ROUTE.effort,
+                        "sandbox": SURGEON_ROUTE.sandbox,
+                        "configurable": False,
+                    }
                 },
             },
             sort_keys=True,
@@ -2008,10 +2530,17 @@ def verify_receipt_envelope(envelope: Any) -> dict[str, Any]:
     }:
         raise DispatchHalt("receipt envelope fields are invalid")
     receipt = envelope["receipt"]
-    if not isinstance(receipt, dict) or set(receipt) != RECEIPT_FIELDS:
+    if not isinstance(receipt, dict):
         raise DispatchHalt("receipt fields are invalid")
-    if receipt["schema"] != SCHEMA:
-        raise DispatchHalt(f"receipt schema must be {SCHEMA}")
+    schema = receipt.get("schema")
+    if schema == SCHEMA:
+        expected_fields = RECEIPT_FIELDS
+    elif schema == SURGEON_SCHEMA:
+        expected_fields = SURGEON_RECEIPT_FIELDS
+    else:
+        raise DispatchHalt(f"receipt schema must be {SCHEMA} or {SURGEON_SCHEMA}")
+    if set(receipt) != expected_fields:
+        raise DispatchHalt("receipt fields are invalid")
     if receipt["mechanism"] != "codex-exec-local":
         raise DispatchHalt("receipt mechanism mismatch")
     if receipt["claim_class"] != "dispatcher_configured_and_host_observed":
@@ -2069,6 +2598,21 @@ def verify_receipt_envelope(envelope: Any) -> dict[str, Any]:
     verify_policy_binding(receipt)
 
     status = receipt["status"]
+    if schema == SURGEON_SCHEMA:
+        precondition = receipt["workspace_precondition"]
+        if precondition is None:
+            if status != "halt":
+                raise DispatchHalt(
+                    "passing surgeon receipt requires a workspace precondition"
+                )
+        elif (
+            not isinstance(precondition, dict)
+            or set(precondition) != {"kind", "starting_head"}
+            or precondition.get("kind") != "clean-linked-git-worktree"
+            or not isinstance(precondition.get("starting_head"), str)
+            or GIT_OBJECT_ID_PATTERN.fullmatch(precondition["starting_head"]) is None
+        ):
+            raise DispatchHalt("surgeon workspace precondition is invalid")
     if status == "pass":
         if not isinstance(envelope["result"], str):
             raise DispatchHalt("passing receipt result must be a string")
@@ -2216,14 +2760,17 @@ def parser() -> argparse.ArgumentParser:
     strict_enable_parser.set_defaults(func=strict_enable)
 
     strict_disable_parser = subparsers.add_parser(
-        "strict-disable", help="restore config managed by strict-enable when unchanged"
+        "strict-disable",
+        help="restore the strict setting while preserving unrelated additions",
     )
     strict_disable_parser.set_defaults(func=strict_disable)
 
     dispatch_parser = subparsers.add_parser(
         "dispatch", help="run one host-observed local route"
     )
-    dispatch_parser.add_argument("--route", required=True, choices=sorted(ROUTES))
+    dispatch_parser.add_argument(
+        "--route", required=True, choices=sorted((*ROUTES, "surgeon"))
+    )
     dispatch_parser.add_argument("--workdir", required=True)
     dispatch_parser.add_argument(
         "--prompt-file", help="read the task from a regular file; defaults to stdin"

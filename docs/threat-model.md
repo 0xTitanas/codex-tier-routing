@@ -10,8 +10,9 @@ credential sandbox.
 For a dispatch that returns `status: pass`, the project aims to provide local
 evidence that:
 
-- one stable route and validated policy selected the requested model, reasoning effort, local
-  filesystem sandbox, approval policy, and working directory;
+- one recognized route and validated policy selected the requested model,
+  reasoning effort, local filesystem sandbox, approval policy, and working
+  directory;
 - the complete effective policy, canonical policy hash, and policy-input hash
   were bound into the receipt without making model-entitlement claims;
 - the Codex host wrote matching session and turn observations;
@@ -20,6 +21,9 @@ evidence that:
   change during the dispatch;
 - captured command streams, task input, rollout input, and ledger entries stayed
   within explicit memory or file-size limits;
+- no other write-capable routed child running as the same operating-system
+  identity held the same device/inode-identified workdir writer lock during
+  execution, including a child using another Codex home;
 - a timeout, malformed stream, incomplete rollout, route mismatch, unsafe path,
   or ambiguous process outcome failed closed; and
 - installation either completed as one reviewed bundle or restored the prior
@@ -64,6 +68,7 @@ must remove group write before use.
 - missing, duplicate, malformed, stale, oversized, or contradictory execution
   evidence;
 - unbounded stdout, stderr, prompt, rollout, or ledger-entry growth;
+- concurrent write-capable routes targeting the same workdir;
 - blind retries after an ambiguous write-capable outcome; and
 - handled installer failures that would otherwise leave a partial bundle.
 
@@ -73,10 +78,15 @@ The project does not defend against:
 
 - root, the current operating-system identity, or another trusted writer
   replacing files and recomputing hashes;
+- availability against another local identity pre-creating the predictable
+  owner-private writer-lock path in the sticky system temporary directory;
 - a same-identity race between path validation and process execution;
 - a compromised kernel, Python runtime, Codex binary, Codex host, or provider;
 - provider-side model substitution or cryptographic model attestation;
 - correctness, safety, or trustworthiness of model output;
+- a read-only route observing a workspace while a writer changes it; the writer
+  lock prevents concurrent routed writers, not inconsistent reads or writes
+  launched outside the dispatcher;
 - account entitlement or selected-model compatibility inferred from policy
   syntax alone;
 - crash or power-loss atomicity during installation;
@@ -103,7 +113,10 @@ Operators should:
    changed route.
 4. Inspect configured MCP, plugin, connector, and web-search capabilities
    separately when external effects matter.
-5. Use a clean worktree or disposable branch for write-capable routes.
+5. Use a clean worktree or disposable branch for stable write-capable routes;
+   use a clean linked Git worktree without submodules or Git `filter`
+   attributes for `surgeon`, and require explicit completion criteria plus
+   parent review before integrating its output.
 6. Treat every child result as untrusted and independently verify files, tests,
    and claimed facts.
 7. Reconcile workspace state before retrying a timeout or any ambiguous failure.

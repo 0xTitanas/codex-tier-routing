@@ -5,7 +5,7 @@
 **Stable Codex task routes, configurable model/effort mappings, and host-observed receipts.**
 
 [![License: MIT](https://img.shields.io/badge/license-MIT-2ea44f.svg)](LICENSE)
-[![Release: v1.0.0-rc.2](https://img.shields.io/badge/release-v1.0.0--rc.2-f0ad4e.svg)](CHANGELOG.md)
+[![Release: v1.1.0-rc.1](https://img.shields.io/badge/release-v1.1.0--rc.1-f0ad4e.svg)](CHANGELOG.md)
 [![Platforms: macOS + Linux](https://img.shields.io/badge/platforms-macOS%20%2B%20Linux-4c78ff.svg)](docs/compatibility.md)
 
 </div>
@@ -17,7 +17,7 @@ Original project by <a href="https://github.com/0xTitanas">0xTitanas</a> ·
 <a href="https://github.com/0xTitanas/codex-tier-routing">Canonical repository</a>
 </p>
 
-`codex-tier-routing` installs five Codex agent profiles and a local dispatcher.
+`codex-tier-routing` installs six Codex agent profiles and a local dispatcher.
 The profiles make task intent explicit. The dispatcher adds the part a profile
 cannot provide on its own: a host-observed receipt that records the model,
 effort, sandbox, approval policy, working directory, and child session seen in
@@ -28,9 +28,9 @@ not endorsed by or affiliated with OpenAI. It uses documented Codex CLI and
 configuration behavior, but its rollout parsing and compatibility assertions
 remain this project's responsibility.
 
-The current release candidate is `v1.0.0-rc.2`. It is feature-complete within
-the documented compatibility boundary and is prepared for clean-runner and
-independent-install validation before the stable `v1.0.0` tag.
+The current release candidate is `v1.1.0-rc.1`. It remains a candidate until
+the documented clean-runner, independent-install, and changed-route canary
+gates pass.
 
 The project does not prove provider-side model identity, measure cost or
 quality improvements, or make delegated output trustworthy by itself. The
@@ -42,21 +42,29 @@ must have access to each configured model.
 
 | Route | Default model | Default effort | Fixed sandbox | Typical use |
 |---|---|---|---|---|
-| `scout` | `gpt-5.6-luna` | low | read-only | Search, dependency surveys, documentation lookup |
+| `scout` | `gpt-5.6-terra` | low | read-only | Search, dependency surveys, documentation lookup |
 | `grunt` | `gpt-5.6-luna` | low | workspace-write | Formatting, boilerplate, mechanical edits |
 | `builder` | `gpt-5.6-terra` | medium | workspace-write | Scoped features, fixes, tests, and refactors |
-| `reviewer` | `gpt-5.6-terra` | high | read-only | Correctness, security, and coverage review |
+| `reviewer` | `gpt-5.6-sol` | high | read-only | Correctness, security, and coverage review |
 | `architect` | `gpt-5.6-sol` | xhigh | read-only | Difficult design decisions |
+| `surgeon` | `gpt-5.6-sol` | high | workspace-write | Bounded cross-cutting refactors, migrations, and difficult multi-file fixes |
 
 These defaults work without a policy file. An owner may change only the model
-and effort mapping through one validated TOML file. Route names, sandbox modes,
-network posture, approval policy, and concurrency limits remain fixed in code.
+and effort mapping for the five stable routes through one validated TOML file.
+The experimental `surgeon` tuple, route names, sandbox modes, network posture,
+approval policy, and concurrency limits remain fixed in code.
+
+`surgeon` is the highest-blast-radius route. Use it only in a clean linked Git
+worktree with explicit completion criteria, and require parent review before
+integration. Its enforced preflight currently rejects submodules and any Git
+`filter` attributes to avoid running repository-configured helpers outside the
+Codex sandbox.
 
 ## How it works
 
 ```text
 Task
-  -> choose one stable route
+  -> choose one recognized route
   -> load and validate the active model/effort policy
   -> run codex exec with fixed authority boundaries
   -> read the host-written rollout
@@ -82,7 +90,8 @@ parent may also remain single-agent when delegation is unnecessary.
   `codex exec`
 - A working Codex login for that CLI
 - Access to the configured model names
-- macOS or Linux; Windows is not currently supported
+- macOS or x86-64 Ubuntu 22.04, 24.04, or 26.04 LTS; Windows is not currently
+  supported
 
 See [compatibility](docs/compatibility.md) for the tested boundary.
 
@@ -204,16 +213,19 @@ install -m 600 policy.sample.toml "$POLICY_DIR/policy.toml"
 
 Edit only `model` and `effort` in
 `${CODEX_HOME:-$HOME/.codex}/tier-routing/policy.toml`. The file must retain
-all five routes and remain mode `0600`; its directory must remain mode `0700`.
+all five configurable routes and remain mode `0600`; its directory must remain
+mode `0700`. `surgeon` is experimental and is not configurable through
+`policy.toml` in this release.
 `policy-check` is offline: it rejects unknown fields, unsafe model-ID syntax,
 and unsupported effort values, then prints the fully resolved mapping and the
 accepted effort list.
 
 This release accepts `none`, `low`, `medium`, `high`, `xhigh`, and `max`, the
-reasoning-effort set published for the default GPT-5.6 family. It intentionally
-does not accept `minimal` or `ultra`. A syntactically valid model name is not
+reasoning-effort set published for the default GPT-5.6 family. `minimal` is
+prior-generation vocabulary, and `ultra` remains outside this release's tested
+and attested dispatcher boundary. A syntactically valid model name is not
 proof that the current account can use it or that a different model supports
-the selected effort. Codex CLI 0.144.1 does not expose a trusted
+the selected effort. Codex CLI 0.144.4 does not expose a trusted
 account-entitlement list, so `policy-check` reports
 `model_access: not_checked`. After each model or effort change, run one bounded
 canary for every changed route. A failed canary HALTs; the dispatcher never
@@ -236,8 +248,10 @@ disabled. To restore the configuration that `strict-enable` managed:
 ```
 
 Restart every Codex surface using that home afterward. The command restores the
-previous configuration only when the managed file has not drifted; otherwise it
-HALTs rather than overwriting newer changes.
+managed `features.multi_agent` value while preserving unrelated appended
+sections, including host-added project trust metadata. It HALTs without
+overwriting the file if that managed setting changed or the edit is otherwise
+ambiguous.
 
 To uninstall, run the exact uninstall command printed by the successful
 installer. It restores any strict configuration managed by that installation
@@ -245,6 +259,10 @@ before removing the installed profiles, skill, and dispatcher. Backup trees,
 custom policy, and the local receipt ledger are retained for manual inspection
 or removal. If native spawning was already disabled before installation,
 disable and uninstall leave that setting unchanged.
+
+Writer-lock files under `/tmp/codex-tier-routing-<uid>-locks` are also retained
+to avoid split-inode races. Remove that owner-only directory only when no routed
+dispatch can still be running as that operating-system identity.
 
 ## Commands
 
@@ -309,10 +327,13 @@ The installer and dispatcher:
   and the complete effective policy into each receipt;
 - run `codex exec --strict-config`, force workspace network off and extra
   writable roots empty at launch, and fail closed unless the host rollout uses
-  Codex 0.144.1's canonical empty-root encoding; receipts normalize that
+  Codex 0.144.4's canonical empty-root encoding; receipts normalize that
   verified omission to an explicit `writable_roots: []`;
 - launch each child with approval policy `never` and verify the observed
   value afterward;
+- prevent concurrent write-capable routes from targeting the same
+  device/inode-identified workdir across Codex homes used by the same operating-
+  system identity;
 - kill the child process group on timeout or stream failure;
 - record a halt instead of accepting missing or mismatched observations.
 
@@ -335,8 +356,10 @@ Read [SECURITY.md](SECURITY.md) and the
 
 ## Platform support
 
-- macOS and Linux are tested and supported today.
-- Windows support is actively in development — not yet ready for use.
+- macOS and x86-64 Ubuntu 22.04, 24.04, and 26.04 LTS are tested and supported
+  today. Other Linux distributions and architectures are outside the
+  release-gated compatibility boundary.
+- Windows is not currently supported.
 
 ## Limits
 
@@ -376,12 +399,14 @@ ruff format --check scripts tests bin/codex-tier.py
 
 ## Repository map
 
-- [`agents/`](agents/): five Codex agent profiles
+- [`agents/`](agents/): six Codex agent profiles
 - [`bin/codex-tier`](bin/codex-tier): hardened POSIX launcher
 - [`bin/codex-tier.py`](bin/codex-tier.py): local dispatcher runtime
 - [`skills/model-routing/SKILL.md`](skills/model-routing/SKILL.md): routing policy
 - [`schemas/local-dispatch-receipt.schema.json`](schemas/local-dispatch-receipt.schema.json): receipt contract
 - [`schemas/local-dispatch-envelope.schema.json`](schemas/local-dispatch-envelope.schema.json): emitted envelope contract
+- [`schemas/local-dispatch-receipt-v3.schema.json`](schemas/local-dispatch-receipt-v3.schema.json): experimental surgeon receipt contract
+- [`schemas/local-dispatch-envelope-v3.schema.json`](schemas/local-dispatch-envelope-v3.schema.json): experimental surgeon envelope contract
 - [`docs/local-dispatcher.md`](docs/local-dispatcher.md): detailed behavior and limits
 - [`docs/compatibility.md`](docs/compatibility.md): tested compatibility boundary
 - [`docs/threat-model.md`](docs/threat-model.md): security goals, trust anchors, and exclusions

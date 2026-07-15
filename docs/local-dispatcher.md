@@ -4,24 +4,26 @@ The bundled `codex-tier` command is the portable execution path for Codex
 surfaces that can run terminal commands but cannot select a registered custom
 agent through their delegation tool.
 
-It does not choose tasks or verify their results. The parent still
-classifies the task, chooses one stable route, verifies the result, and owns the
-final answer.
+It does not choose tasks or verify their results. The parent still classifies
+the task, chooses one recognized route, verifies the result, and owns the final
+answer.
 
 ## Default route table
 
 | Route | Requested model | Effort | Sandbox |
 |---|---|---|---|
-| `scout` | `gpt-5.6-luna` | low | read-only |
+| `scout` | `gpt-5.6-terra` | low | read-only |
 | `grunt` | `gpt-5.6-luna` | low | workspace-write |
 | `builder` | `gpt-5.6-terra` | medium | workspace-write |
-| `reviewer` | `gpt-5.6-terra` | high | read-only |
+| `reviewer` | `gpt-5.6-sol` | high | read-only |
 | `architect` | `gpt-5.6-sol` | xhigh | read-only |
+| `surgeon` | `gpt-5.6-sol` | high | workspace-write |
 
 The dispatcher accepts no per-dispatch model, effort, sandbox, or approval
 override. An optional owner-only policy file may replace only the model and
-effort values. Sandbox, network, approval, role, and concurrency boundaries are
-not configurable.
+effort values for the five stable routes. The experimental `surgeon` tuple,
+sandbox, network, approval, role, and concurrency boundaries are not
+configurable.
 
 ## Commands
 
@@ -70,12 +72,14 @@ ${CODEX_HOME:-$HOME/.codex}/tier-routing/policy.toml
 Copy `policy.sample.toml` there as mode `0600` inside a mode-`0700`
 `tier-routing/` directory. The file schema is
 `codex-tier-routing/policy/v1`. Its top-level keys must be exactly `schema` and
-`routes`; all five routes are required; and each route accepts
-exactly `model` and `effort`. Unknown fields halt before a model call.
+`routes`; all five stable routes are required; and each route accepts exactly
+`model` and `effort`. `surgeon` is fixed outside this owner policy in this
+release. Unknown fields halt before a model call.
 
 Model IDs are bounded ASCII identifiers. Accepted efforts are `none`, `low`,
 `medium`, `high`, `xhigh`, and `max`, matching the published default GPT-5.6
-family; `minimal` and `ultra` are outside this release's bounded policy.
+family; `minimal` is prior-generation vocabulary, and `ultra` is outside this
+release's tested and attested dispatcher boundary.
 `policy-check` reports syntax and the resolved mapping, not account entitlement
 or compatibility for a different model. The tested Codex CLI
 does not provide a trusted non-interactive model-entitlement enumeration. Run
@@ -96,8 +100,10 @@ Before the first dispatch, enable strict mode and restart Codex:
 
 Strict mode disables the native generic subagent channel in the user's Codex
 configuration. The operation preserves the original bytes in an owner-only
-backup and records before/after hashes. `strict-disable` restores those bytes
-only if the managed config has not drifted. Both operations are zero-model-call
+backup and records before/after hashes. `strict-disable` reverses only the
+managed `features.multi_agent` edit and preserves unrelated appended sections
+such as host-added project trust metadata. It HALTs if the managed setting
+changed or the edit is ambiguous. Both operations are zero-model-call
 configuration actions.
 
 The strict-state manifest and backup are retained at
@@ -131,12 +137,30 @@ not a feature-state field attested by the child rollout. Restart is required
 after changing strict mode because already-running sessions retain their
 previous tool surface, which the dispatch-time probe cannot inspect.
 
-`grunt` and `builder` operate directly in the selected workspace. Their edits
-may exist even when post-execution receipt verification halts. Use a clean
-worktree or disposable branch, inspect repository state after every ambiguous
-outcome, and do not retry until effects are reconciled.
+`grunt`, `builder`, and `surgeon` operate directly in the selected workspace.
+The dispatcher takes a nonblocking exclusive writer lock keyed by that
+directory's device and inode identity in an owner-only namespace under
+`/tmp/codex-tier-routing-<uid>-locks`. The namespace is independent of
+`CODEX_HOME`, so write routes run by the same operating-system identity cannot
+run concurrently in one workdir even when they use different Codex homes. Lock
+files are retained to avoid split-inode races. This does not create a filesystem
+snapshot or serialize read-only routes. Edits may exist even when post-execution
+receipt verification halts. `surgeon` additionally requires a clean linked Git
+worktree root with a valid SHA-1 or SHA-256 starting HEAD. The enforced preflight
+rejects submodules and any Git `filter` attributes rather than risk executing
+repository-configured filter helpers outside the Codex sandbox. Separately, the
+operator must provide explicit completion criteria and parent review before
+integration. Inspect repository state after every ambiguous outcome, and do not
+retry until effects are reconciled.
 
 ## What the receipt proves
+
+The five stable routes emit
+`codex-tier-routing/local-dispatch-receipt/v2`. The fixed experimental
+`surgeon` route emits `codex-tier-routing/local-dispatch-receipt/v3`, which also
+binds the clean linked-worktree precondition and starting Git `HEAD`.
+`receipt-check` accepts retained v2 envelopes and current v3 surgeon envelopes;
+each must also validate against its matching published JSON Schema.
 
 `codex-tier` parses the child command's JSONL stream, obtains the unique child
 session identifier, and reads the matching host-written rollout under the
@@ -154,7 +178,7 @@ The receipt passes only when the rollout matches all of these values:
 - requested sandbox;
 - the full recorded sandbox policy; write-capable routes must explicitly record
   `network_access: false`, both temporary-directory exclusion booleans, and
-  Codex 0.144.1's canonical empty-root encoding (a missing network field or any
+  Codex 0.144.4's canonical empty-root encoding (a missing network field or any
   raw `writable_roots` field is not accepted);
 - `never` approval policy;
 - resolved working directory.
@@ -163,7 +187,7 @@ For every child, the invocation pins
 `sandbox_workspace_write.network_access=false` and
 `sandbox_workspace_write.writable_roots=[]` at command-line configuration
 precedence and enables `--strict-config` so an unrecognized config key fails
-before execution. Codex 0.144.1 omits `writable_roots` from its raw rollout when
+before execution. Codex 0.144.4 omits `writable_roots` from its raw rollout when
 the list is empty and emits the field when roots are present. The verifier
 rejects every raw field, then normalizes the verified empty state to the
 explicit `writable_roots: []` stored in the receipt. This prevents a user or
@@ -220,11 +244,12 @@ untrusted until the parent checks it against the task and repository state.
 ## Failure behavior
 
 The dispatcher halts on a missing executable, invalid or unsafe policy, invalid
-task input, four active dispatches, nonzero child exit, malformed or incomplete
-JSONL, missing or stale rollout, route or policy mismatch, unsafe local ledger
-path, or timeout. A halt receipt is recorded when execution reached the
-dispatch boundary and the local ledger is safe. Preflight refusals occur before
-a model call.
+task input, four active dispatches in the selected Codex home, a writer already
+active in the same workdir, nonzero child exit, malformed or incomplete JSONL,
+missing or stale rollout, route or policy mismatch, unsafe local ledger path, or
+timeout. A halt
+receipt is recorded when execution reached the dispatch boundary and the local
+ledger is safe. Preflight refusals occur before a model call.
 
 Run one realistic, read-only canary after installation and after material
 Codex-version, surface, account, or model-access changes. Do not fan out until
