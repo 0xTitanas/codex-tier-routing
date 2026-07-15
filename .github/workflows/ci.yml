@@ -263,15 +263,15 @@ jobs:
               Move-Item -LiteralPath $temporary -Destination $link
           }
 
-          $workspace = Get-LocalPath $env:GITHUB_WORKSPACE 'GITHUB_WORKSPACE'
+          $sourceWorkspace = Get-LocalPath $env:GITHUB_WORKSPACE 'GITHUB_WORKSPACE'
           $pythonRoot = Get-LocalPath $env:pythonLocation 'pythonLocation'
           $toolCache = Get-LocalPath $env:RUNNER_TOOL_CACHE 'RUNNER_TOOL_CACHE'
           $runnerTemp = Get-LocalPath $env:RUNNER_TEMP 'RUNNER_TEMP'
           $runnerRoot = [IO.Directory]::GetParent($runnerTemp).FullName
           $runnerPrefix = $runnerRoot.TrimEnd('\') + '\'
-          if (-not $workspace.StartsWith($runnerPrefix, [StringComparison]::OrdinalIgnoreCase)) { Fail 'GITHUB_WORKSPACE is outside the hosted runner root' }
+          if (-not $sourceWorkspace.StartsWith($runnerPrefix, [StringComparison]::OrdinalIgnoreCase)) { Fail 'GITHUB_WORKSPACE is outside the hosted runner root' }
           $repositoryParts = $env:GITHUB_REPOSITORY.Split([char]'/', [StringSplitOptions]::RemoveEmptyEntries)
-          $workspaceParts = $workspace.Substring($runnerPrefix.Length).Split([char]'\', [StringSplitOptions]::RemoveEmptyEntries)
+          $workspaceParts = $sourceWorkspace.Substring($runnerPrefix.Length).Split([char]'\', [StringSplitOptions]::RemoveEmptyEntries)
           if ($repositoryParts.Count -ne 2 -or $workspaceParts.Count -ne 2 -or
               -not [string]::Equals($workspaceParts[0], $repositoryParts[1], [StringComparison]::OrdinalIgnoreCase) -or
               -not [string]::Equals($workspaceParts[1], $repositoryParts[1], [StringComparison]::OrdinalIgnoreCase)) { Fail 'GITHUB_WORKSPACE is not an exact hosted checkout path' }
@@ -281,29 +281,58 @@ jobs:
           $python = Join-Path $pythonRoot 'python.exe'
           if (-not (Test-Path -LiteralPath $python)) { Fail 'python.exe is missing from pythonLocation' }
 
-          $workspaceChain = @(Get-ExistingChain $workspace 'GITHUB_WORKSPACE')
           $pythonChain = @(Get-ExistingChain $pythonRoot 'pythonLocation')
-          $workspaceTree = Get-Tree $workspace 'GITHUB_WORKSPACE' $false
+          $sourceTree = Get-Tree $sourceWorkspace 'GITHUB_WORKSPACE' $false
           [void](Get-Tree $pythonRoot 'pythonLocation' $true)
           Materialize-Python3Link $pythonRoot
           $pythonTree = Get-Tree $pythonRoot 'pythonLocation' $false
 
-          $ancestors = @()
-          if ($workspaceChain.Count -gt 1) { $ancestors += $workspaceChain[0..($workspaceChain.Count - 2)] }
-          if ($pythonChain.Count -gt 1) { $ancestors += $pythonChain[0..($pythonChain.Count - 2)] }
-          $seen = @{}
-          foreach ($path in $ancestors) {
-              if ($seen[$path]) { continue }
-              $seen[$path] = $true
+          if ($pythonChain.Count -gt 1) {
+            foreach ($path in $pythonChain[0..($pythonChain.Count - 2)]) {
               $item = Get-Item -LiteralPath $path -Force
               if (-not $item.PSIsContainer) { Fail "ancestor is not a directory: $path" }
               # Preserve each sibling's effective ACL before replacing the parent DACL.
               Protect-DirectChildren $item.FullName
               Set-ProtectedAcl $item.FullName $true $false
+            }
           }
-          foreach ($item in @($workspaceTree + $pythonTree)) { Set-ProtectedAcl $item.FullName $item.PSIsContainer $item.PSIsContainer }
+          foreach ($item in $pythonTree) { Set-ProtectedAcl $item.FullName $item.PSIsContainer $item.PSIsContainer }
 
-          $privateRoot = Join-Path $workspace '.codex-tier-ci-private'
+          $ciRoot = Join-Path $pythonRoot '.codex-tier-ci'
+          if (Test-Path -LiteralPath $ciRoot) { Fail 'CI staging root already exists' }
+          [IO.Directory]::CreateDirectory($ciRoot) | Out-Null
+          Set-ProtectedAcl $ciRoot $true $true
+          $workspace = Join-Path $ciRoot 'source'
+          [IO.Directory]::CreateDirectory($workspace) | Out-Null
+          foreach ($sourceItem in $sourceTree) {
+              $relative = $sourceItem.FullName.Substring($sourceWorkspace.Length).TrimStart([char]'\')
+              if (-not $relative) { continue }
+              $current = Get-Item -LiteralPath $sourceItem.FullName -Force
+              if (($current.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0 -or
+                  $current.PSIsContainer -ne $sourceItem.PSIsContainer) { Fail "GITHUB_WORKSPACE changed during staging: $($sourceItem.FullName)" }
+              $destination = Join-Path $workspace $relative
+              if ($current.PSIsContainer) {
+                  [IO.Directory]::CreateDirectory($destination) | Out-Null
+              } else {
+                  [IO.Directory]::CreateDirectory([IO.Path]::GetDirectoryName($destination)) | Out-Null
+                  [IO.File]::Copy($current.FullName, $destination, $false)
+              }
+          }
+          $workspaceTree = Get-Tree $workspace 'staged GITHUB_WORKSPACE' $false
+          foreach ($item in $workspaceTree) { Set-ProtectedAcl $item.FullName $item.PSIsContainer $item.PSIsContainer }
+
+          if ($env:GITHUB_SHA -notmatch '^[0-9a-fA-F]{40}([0-9a-fA-F]{24})?$') { Fail 'GITHUB_SHA is invalid' }
+          Set-Location -LiteralPath $workspace
+          $stagedHead = ([string](& git rev-parse --verify HEAD)).Trim()
+          if ($LASTEXITCODE -ne 0 -or -not [string]::Equals($stagedHead, $env:GITHUB_SHA, [StringComparison]::OrdinalIgnoreCase)) { Fail 'staged checkout HEAD does not match GITHUB_SHA' }
+          & git fsck --strict
+          if ($LASTEXITCODE -ne 0) { Fail 'staged checkout failed git fsck' }
+          & git diff --no-ext-diff --no-textconv --exit-code $env:GITHUB_SHA --
+          if ($LASTEXITCODE -ne 0) { Fail 'staged checkout differs from GITHUB_SHA' }
+          $untracked = @(& git ls-files --others --exclude-standard)
+          if ($LASTEXITCODE -ne 0 -or $untracked.Count -ne 0) { Fail 'staged checkout contains untracked files' }
+
+          $privateRoot = Join-Path $ciRoot 'home'
           [IO.Directory]::CreateDirectory($privateRoot) | Out-Null
           Set-ProtectedAcl $privateRoot $true $true
           $privateTemp = Join-Path $privateRoot 'tmp'
@@ -341,6 +370,7 @@ jobs:
           if ($LASTEXITCODE -ne 0) { Fail 'post-hardening Python-prefix verification failed' }
 
           "CODEX_TIER_PYTHON_BIN=$python" | Add-Content -LiteralPath $env:GITHUB_ENV
+          "CODEX_TIER_CI_SOURCE_ROOT=$workspace" | Add-Content -LiteralPath $env:GITHUB_ENV
           "CODEX_TIER_CI_PRIVATE_ROOT=$privateRoot" | Add-Content -LiteralPath $env:GITHUB_ENV
           "CODEX_TIER_CI_PRIVATE_TEMP=$privateTemp" | Add-Content -LiteralPath $env:GITHUB_ENV
       - name: Harden macOS tool paths
@@ -391,7 +421,10 @@ jobs:
         run: python3 scripts/validate.py
       - name: Validate repository (Windows)
         if: runner.os == 'Windows'
-        run: python scripts/validate.py
+        shell: pwsh
+        run: |
+          Set-Location -LiteralPath $env:CODEX_TIER_CI_SOURCE_ROOT
+          & $env:CODEX_TIER_PYTHON_BIN scripts/validate.py
       - name: Run unit tests (POSIX)
         if: runner.os != 'Windows'
         run: |
@@ -401,11 +434,12 @@ jobs:
         if: runner.os == 'Windows'
         shell: pwsh
         run: |
+          Set-Location -LiteralPath $env:CODEX_TIER_CI_SOURCE_ROOT
           $env:USERPROFILE = $env:CODEX_TIER_CI_PRIVATE_ROOT
           $env:HOME = $env:CODEX_TIER_CI_PRIVATE_ROOT
           $env:TEMP = $env:CODEX_TIER_CI_PRIVATE_TEMP
           $env:TMP = $env:CODEX_TIER_CI_PRIVATE_TEMP
-          python -m unittest discover -s tests -v
+          & $env:CODEX_TIER_PYTHON_BIN -m unittest discover -s tests -v
       - name: Check POSIX shell syntax
         if: runner.os != 'Windows'
         run: |
@@ -420,10 +454,11 @@ jobs:
             tests/test_windows_installer.py
       - name: Compile Python sources (Windows)
         if: runner.os == 'Windows'
-        run: >-
-          python -m py_compile bin/codex-tier.py scripts/validate.py
-          tests/test_codex_tier.py tests/test_installer.py tests/test_validate.py
-          tests/test_windows.py tests/test_windows_installer.py
+        shell: pwsh
+        run: |
+          Set-Location -LiteralPath $env:CODEX_TIER_CI_SOURCE_ROOT
+          $env:PYTHONPYCACHEPREFIX = Join-Path $env:CODEX_TIER_CI_PRIVATE_TEMP 'pycache'
+          & $env:CODEX_TIER_PYTHON_BIN -m py_compile bin/codex-tier.py scripts/validate.py tests/test_codex_tier.py tests/test_installer.py tests/test_validate.py tests/test_windows.py tests/test_windows_installer.py
       - name: Exercise POSIX strict installer dry-run
         if: runner.os != 'Windows'
         run: |
@@ -435,6 +470,7 @@ jobs:
         if: runner.os == 'Windows'
         shell: pwsh
         run: |
+          Set-Location -LiteralPath $env:CODEX_TIER_CI_SOURCE_ROOT
           $env:USERPROFILE = $env:CODEX_TIER_CI_PRIVATE_ROOT
           $env:HOME = $env:CODEX_TIER_CI_PRIVATE_ROOT
           $env:TEMP = $env:CODEX_TIER_CI_PRIVATE_TEMP
@@ -445,18 +481,32 @@ jobs:
           $env:CODEX_HOME = $testHome
           & "$testHome\bin\codex-tier.ps1" --version
           if ($LASTEXITCODE -ne 0) { throw 'Installed Windows command failed' }
-          Remove-Item -LiteralPath $testHome -Recurse -Force
-          Remove-Item -LiteralPath $env:CODEX_TIER_CI_PRIVATE_ROOT -Recurse -Force
       - name: Verify source tree unchanged (POSIX)
         if: runner.os != 'Windows'
         run: |
-          /usr/bin/git diff --exit-code
+          /usr/bin/git diff --exit-code HEAD
           test -z "$(/usr/bin/git ls-files --others --exclude-standard)"
       - name: Verify source tree unchanged (Windows)
         if: runner.os == 'Windows'
         shell: pwsh
         run: |
-          git diff --exit-code
-          if (git ls-files --others --exclude-standard) {
-            throw 'untracked files were created in the source tree'
+          Set-Location -LiteralPath $env:CODEX_TIER_CI_SOURCE_ROOT
+          $head = ([string](& git rev-parse --verify HEAD)).Trim()
+          if ($LASTEXITCODE -ne 0 -or -not [string]::Equals($head, $env:GITHUB_SHA, [StringComparison]::OrdinalIgnoreCase)) { throw 'staged source HEAD changed' }
+          git diff --no-ext-diff --no-textconv --exit-code $env:GITHUB_SHA --
+          if ($LASTEXITCODE -ne 0) { throw 'tracked files changed in the staged source tree' }
+          $untracked = @(git ls-files --others --exclude-standard)
+          if ($LASTEXITCODE -ne 0) { throw 'unable to inspect the staged source tree' }
+          if ($untracked.Count -ne 0) {
+            throw 'untracked files were created in the staged source tree'
+          }
+          Set-Location -LiteralPath $env:GITHUB_WORKSPACE
+          $head = ([string](& git rev-parse --verify HEAD)).Trim()
+          if ($LASTEXITCODE -ne 0 -or -not [string]::Equals($head, $env:GITHUB_SHA, [StringComparison]::OrdinalIgnoreCase)) { throw 'checkout source HEAD changed' }
+          git diff --no-ext-diff --no-textconv --exit-code $env:GITHUB_SHA --
+          if ($LASTEXITCODE -ne 0) { throw 'tracked files changed in the checkout source tree' }
+          $untracked = @(git ls-files --others --exclude-standard)
+          if ($LASTEXITCODE -ne 0) { throw 'unable to inspect the checkout source tree' }
+          if ($untracked.Count -ne 0) {
+            throw 'untracked files were created in the checkout source tree'
           }
