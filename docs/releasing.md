@@ -43,7 +43,7 @@ interactive console or RDP session, including a fresh install and bounded live
 canaries for all six routes when authentication is available. OpenSSH/Session 0
 does not satisfy this release gate for Codex CLI 0.144.4.
 
-If the tag will be published on a date other than `2026-07-14`, update the
+If the tag will be published on a date other than `2026-07-15`, update the
 dated heading in `CHANGELOG.md` and `date-released` in `CITATION.cff` before
 committing. `scripts/validate.py` requires those values to agree.
 

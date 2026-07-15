@@ -146,6 +146,18 @@ class WindowsRuntimeTests(unittest.TestCase):
     def tearDown(self) -> None:
         self.temp.cleanup()
 
+    def fake_codex(self, directory: Path) -> Path:
+        from pip._vendor.distlib.scripts import ScriptMaker
+
+        maker = ScriptMaker(None, str(directory))
+        maker.executable = sys.executable
+        maker.script_template = FAKE_CODEX
+        maker.variants = {""}
+        maker.clobber = True
+        executable = Path(maker.make("codex = fixture:main")[0])
+        CODEX_TIER._windows_secure_private(executable)
+        return executable
+
     def git(self, *arguments: str, cwd: Path | None = None) -> str:
         result = subprocess.run(
             ["git", *arguments],
@@ -189,6 +201,24 @@ class WindowsRuntimeTests(unittest.TestCase):
             str(linked),
         )
         return primary, linked
+
+    def run_launcher(
+        self, launcher: Path, *arguments: str, **kwargs: object
+    ) -> subprocess.CompletedProcess[str]:
+        return subprocess.run(
+            [
+                "powershell.exe",
+                "-NoLogo",
+                "-NoProfile",
+                "-NonInteractive",
+                "-ExecutionPolicy",
+                "Bypass",
+                "-File",
+                str(launcher),
+                *arguments,
+            ],
+            **kwargs,
+        )
 
     def test_private_acl_rejects_inherited_write_and_junctions(self) -> None:
         unsafe = self.base / "unsafe"
@@ -405,6 +435,30 @@ class WindowsRuntimeTests(unittest.TestCase):
                 CODEX_TIER.paths_same(CODEX_TIER.resolve_codex().entrypoint, executable)
             )
 
+        for name, content, message in (
+            ("fake-codex.cmd", b"@echo off\r\n", "native .exe"),
+            ("fake-codex", b"#!/usr/bin/env python\n", "native .exe"),
+            ("fake-codex.ps1", b"Write-Output fake\r\n", "native .exe"),
+            ("renamed-shebang.exe", b"#!/usr/bin/env python\n", "native PE"),
+            ("not-pe.exe", b"not a native executable\n", "native PE"),
+            (
+                "mz-not-pe.exe",
+                b"MZ" + b"\0" * 58 + (64).to_bytes(4, "little") + b"NOPE",
+                "native PE",
+            ),
+        ):
+            with self.subTest(name=name):
+                candidate = self.base / name
+                candidate.write_bytes(content)
+                CODEX_TIER._windows_secure_private(candidate)
+                with (
+                    mock.patch.dict(
+                        os.environ, {"CODEX_TIER_CODEX_BIN": str(candidate)}
+                    ),
+                    self.assertRaisesRegex(CODEX_TIER.DispatchHalt, message),
+                ):
+                    CODEX_TIER.resolve_codex()
+
         result = subprocess.run(
             ["icacls.exe", str(executable), "/grant", "*S-1-5-4:(M)"],
             text=True,
@@ -436,43 +490,33 @@ class WindowsRuntimeTests(unittest.TestCase):
         ):
             CODEX_TIER.resolve_codex()
 
-    def test_native_launcher_ignores_forged_system_bootstrap_paths(self) -> None:
+    def test_native_launcher_treats_metacharacters_as_arguments(self) -> None:
         installed = self.base / "bootstrap-bin"
         installed.mkdir()
         CODEX_TIER.ensure_private_dir(installed)
-        for name in ("codex-tier.cmd", "codex-tier-launcher.ps1", "codex-tier.py"):
+        for name in ("codex-tier.ps1", "codex-tier.py"):
             target = installed / name
             shutil.copy2(ROOT / "bin" / name, target)
             CODEX_TIER._windows_secure_private(target)
-        real_cmd = Path(os.environ["SystemRoot"]) / "System32" / "cmd.exe"
-        forged = self.base / "forged-system-root"
+        marker = self.base / "must-not-exist"
         env = os.environ.copy()
         env.update(
             {
-                "SystemRoot": str(forged),
-                "WINDIR": str(forged),
-                "COMSPEC": str(forged / "cmd.exe"),
-                "__APPDIR__": f"{forged}\\",
                 "CODEX_TIER_PYTHON_BIN": sys.executable,
             }
         )
-        result = subprocess.run(
-            [
-                str(real_cmd),
-                "/d",
-                "/e:off",
-                "/c",
-                str(installed / "codex-tier.cmd"),
-                "--version",
-            ],
+        result = self.run_launcher(
+            installed / "codex-tier.ps1",
+            "policy-check",
+            f"; New-Item -ItemType File -Path '{marker}'",
             text=True,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             env=env,
             check=False,
         )
-        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
-        self.assertEqual(result.stdout.strip(), "codex-tier 1.1.0-rc.1")
+        self.assertEqual(result.returncode, 2, result.stdout + result.stderr)
+        self.assertFalse(marker.exists(), result.stdout + result.stderr)
 
     def test_all_routes_dispatch_and_receipt_check_through_native_launcher(
         self,
@@ -481,8 +525,7 @@ class WindowsRuntimeTests(unittest.TestCase):
         installed.mkdir()
         CODEX_TIER.ensure_private_dir(installed)
         for name in (
-            "codex-tier.cmd",
-            "codex-tier-launcher.ps1",
+            "codex-tier.ps1",
             "codex-tier.py",
         ):
             target = installed / name
@@ -498,15 +541,7 @@ class WindowsRuntimeTests(unittest.TestCase):
         fake_dir = self.base / "fake-bin"
         fake_dir.mkdir()
         CODEX_TIER.ensure_private_dir(fake_dir)
-        fake_script = fake_dir / "fake-codex.py"
-        fake_script.write_text(FAKE_CODEX, encoding="utf-8")
-        CODEX_TIER._windows_secure_private(fake_script)
-        fake_command = fake_dir / "codex.cmd"
-        fake_command.write_text(
-            f'@echo off\r\n"{sys.executable}" -I "{fake_script}" %*\r\n',
-            encoding="ascii",
-        )
-        CODEX_TIER._windows_secure_private(fake_command)
+        fake_command = self.fake_codex(fake_dir)
 
         env = os.environ.copy()
         env.update(
@@ -516,7 +551,7 @@ class WindowsRuntimeTests(unittest.TestCase):
                 "CODEX_TIER_PYTHON_BIN": sys.executable,
             }
         )
-        launcher = installed / "codex-tier.cmd"
+        launcher = installed / "codex-tier.ps1"
         _, surgeon_workdir = self.linked_worktree()
         expected = {**CODEX_TIER.ROUTES, "surgeon": CODEX_TIER.SURGEON_ROUTE}
         envelopes = {}
@@ -527,17 +562,15 @@ class WindowsRuntimeTests(unittest.TestCase):
                     json.dumps({"thread_id": str(uuid.uuid4())}), encoding="utf-8"
                 )
                 CODEX_TIER._windows_secure_private(mode)
-                result = subprocess.run(
-                    [
-                        str(launcher),
-                        "dispatch",
-                        "--route",
-                        route,
-                        "--workdir",
-                        str(surgeon_workdir if route == "surgeon" else self.workdir),
-                        "--timeout",
-                        "20",
-                    ],
+                result = self.run_launcher(
+                    launcher,
+                    "dispatch",
+                    "--route",
+                    route,
+                    "--workdir",
+                    str(surgeon_workdir if route == "surgeon" else self.workdir),
+                    "--timeout",
+                    "20",
                     input="bounded native Windows fixture",
                     text=True,
                     stdout=subprocess.PIPE,
@@ -563,8 +596,9 @@ class WindowsRuntimeTests(unittest.TestCase):
                 ):
                     self.assertEqual(receipt["requested"][key], value)
                     self.assertEqual(receipt["observed"][key], value)
-                checked = subprocess.run(
-                    [str(launcher), "receipt-check"],
+                checked = self.run_launcher(
+                    launcher,
+                    "receipt-check",
                     input=json.dumps(envelope),
                     text=True,
                     stdout=subprocess.PIPE,
@@ -579,8 +613,9 @@ class WindowsRuntimeTests(unittest.TestCase):
             return
         tampered = json.loads(json.dumps(envelopes["scout"]))
         tampered["receipt"]["observed"]["model"] = "gpt-5.6-luna"
-        checked = subprocess.run(
-            [str(launcher), "receipt-check"],
+        checked = self.run_launcher(
+            launcher,
+            "receipt-check",
             input=json.dumps(tampered),
             text=True,
             stdout=subprocess.PIPE,

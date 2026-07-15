@@ -371,7 +371,7 @@ external side effect matters. See the [threat model](threat-model.md).
 The dispatcher is supported on macOS, Linux, and native Windows 11. Windows uses
 SID/DACL checks, rejects reparse points and junctions, takes `LockFileEx` writer
 locks, contains suspended children with a Job Object, and uses native atomic
-replacement. Invoke `bin\\codex-tier.cmd` from a fresh interactive PowerShell
+replacement. Invoke `bin\\codex-tier.ps1` from a fresh interactive PowerShell
 console or RDP session. With Codex CLI 0.144.4, OpenSSH/Session 0 is outside the
 supported boundary because sandboxed tool processes exit before command
 execution with status `0xc0000142`.

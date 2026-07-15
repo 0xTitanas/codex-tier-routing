@@ -12,7 +12,7 @@ boundary only after the release gates below pass.
 | Other Linux distributions or architectures | Outside the release-gated compatibility boundary |
 | Windows 11 | Native CI and fresh install plus manual dispatcher, negative-canary, and all-six-route live checks in an interactive console/RDP session; OpenSSH/Session 0 is excluded for Codex CLI 0.144.4 as described below |
 | Python | 3.11-3.14 in CI; runtime requires 3.11 or newer |
-| Codex CLI | 0.144.4 used for bounded POSIX and native Windows checks |
+| Codex CLI | 0.144.4 used for bounded POSIX checks and as a native `codex.exe` for Windows checks |
 
 The prior recorded Codex checks covered a narrow local environment and small
 tasks. Before the v1.1.0-rc.1 tag, the remapped Terra/low `scout`, remapped
@@ -52,9 +52,12 @@ Windows uses native equivalents: SID-based owner/DACL validation, reparse-point
 and junction rejection, `LockFileEx` writer locks, suspended-process Job Object
 containment, and `MoveFileEx` replacement. Install with `install.ps1`; it performs
 transactional rollback, timestamped collision backups, and a user `PATH` update.
-Run `bin\\codex-tier.cmd` from a fresh interactive console or RDP session.
+Run `bin\\codex-tier.ps1` from a fresh interactive console or RDP session.
 Write-capable routes preserve an explicit `[windows] sandbox = "elevated"`
 setting and otherwise select Codex's documented `unelevated` fallback.
+The tested Windows entrypoint is a native `codex.exe`. Windows `.cmd` and
+`.bat` wrappers are outside this trust boundary and are rejected before
+dispatch.
 
 In a manual check on the tested Codex CLI 0.144.4 host, authenticated dispatch
 and receipt verification succeeded for all six routes from an interactive

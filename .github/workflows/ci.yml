@@ -121,7 +121,7 @@ jobs:
           if ($LASTEXITCODE -ne 0) { throw 'Windows installer failed' }
           $env:CODEX_HOME = $testHome
           $env:CODEX_TIER_PYTHON_BIN = (Get-Command python.exe).Source
-          & "$testHome\bin\codex-tier.cmd" --version
+          & "$testHome\bin\codex-tier.ps1" --version
           if ($LASTEXITCODE -ne 0) { throw 'Installed Windows command failed' }
           Remove-Item -LiteralPath $testHome -Recurse -Force
       - name: Verify source tree unchanged (POSIX)

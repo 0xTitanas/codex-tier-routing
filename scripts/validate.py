@@ -61,8 +61,7 @@ REQUIRED_PUBLIC_FILES = (
     "docs/threat-model.md",
     "policy.sample.toml",
     "install.ps1",
-    "bin/codex-tier.cmd",
-    "bin/codex-tier-launcher.ps1",
+    "bin/codex-tier.ps1",
     "schemas/local-dispatch-receipt.schema.json",
     "schemas/local-dispatch-envelope.schema.json",
     "schemas/local-dispatch-receipt-v3.schema.json",
@@ -96,7 +95,7 @@ PUBLIC_WINDOWS_HOME_PATTERN = re.compile(
 PUBLIC_IPV4_PATTERN = re.compile(r"(?<![0-9])(?:[0-9]{1,3}\.){3}[0-9]{1,3}(?![0-9])")
 PUBLIC_LAB_HOST_PATTERN = re.compile(r"\b[a-z][a-z0-9-]*-lab\b", re.IGNORECASE)
 
-CI_WORKFLOW_SHA256 = "0afb05fd5945193ead375783be9cae497f21af286fe9745f6617d27c995e6fd1"
+CI_WORKFLOW_SHA256 = "4ffbc59f598643063116d971e99a6a41a012ae2a2d93034b8e7bc29802f11395"
 
 
 def check_markers(path: Path, markers: tuple[str, ...], root: Path) -> int:
@@ -504,8 +503,7 @@ def main() -> int:
                 print(f"[PASS] {label} matches the reviewed contract")
 
     launcher = root / "bin" / "codex-tier"
-    windows_launcher = root / "bin" / "codex-tier.cmd"
-    powershell_launcher = root / "bin" / "codex-tier-launcher.ps1"
+    powershell_launcher = root / "bin" / "codex-tier.ps1"
     dispatcher = root / "bin" / "codex-tier.py"
     if not launcher.is_file() or (os.name != "nt" and not os.access(launcher, os.X_OK)):
         failures += 1
@@ -515,17 +513,14 @@ def main() -> int:
             root, ["/bin/sh", "-n", str(launcher)], "bin/codex-tier shell syntax"
         )
     if os.name == "nt":
-        if not windows_launcher.is_file():
-            failures += 1
-            print("[FAIL] bin/codex-tier.cmd: launcher missing")
         if not powershell_launcher.is_file():
             failures += 1
-            print("[FAIL] bin/codex-tier-launcher.ps1: launcher missing")
+            print("[FAIL] bin/codex-tier.ps1: launcher missing")
         else:
             failures += check_powershell_syntax(
                 root,
                 powershell_launcher,
-                "bin/codex-tier-launcher.ps1 PowerShell syntax",
+                "bin/codex-tier.ps1 PowerShell syntax",
             )
     if not dispatcher.is_file():
         failures += 1

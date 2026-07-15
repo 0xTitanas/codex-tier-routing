@@ -1160,6 +1160,31 @@ def resolve_codex() -> CodexLaunch:
     )
     if not entrypoint.is_file() or not os.access(entrypoint, os.X_OK):
         raise DispatchHalt("codex executable is not an executable regular file")
+    if os.name == "nt":
+        if entrypoint.suffix.lower() != ".exe":
+            raise DispatchHalt("Codex entrypoint must be a native .exe on Windows")
+        try:
+            flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
+            descriptor = os.open(entrypoint, flags)
+            with os.fdopen(descriptor, "rb") as handle:
+                if handle.read(2) != b"MZ":
+                    raise DispatchHalt("Codex entrypoint is not a native PE executable")
+                handle.seek(0, os.SEEK_END)
+                size = handle.tell()
+                if size < 0x40:
+                    raise DispatchHalt("Codex entrypoint is not a native PE executable")
+                handle.seek(0x3C)
+                pe_offset = int.from_bytes(handle.read(4), "little")
+                if pe_offset > size - 4:
+                    raise DispatchHalt("Codex entrypoint is not a native PE executable")
+                handle.seek(pe_offset)
+                if handle.read(4) != b"PE\0\0":
+                    raise DispatchHalt("Codex entrypoint is not a native PE executable")
+        except OSError as exc:
+            raise DispatchHalt(
+                f"unable to inspect Codex entrypoint: {type(exc).__name__}"
+            ) from exc
+        return CodexLaunch(entrypoint=entrypoint, runtime=entrypoint)
     shebang = _read_shebang(entrypoint)
     if shebang is None:
         return CodexLaunch(entrypoint=entrypoint, runtime=entrypoint)

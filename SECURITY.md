@@ -51,15 +51,18 @@ environment variables alone cannot enable them in the published artifact.
 On POSIX, the installed dispatcher ships as a `/bin/sh` launcher plus a
 non-executable Python source file. The launcher clears dynamic-loader and Python
 startup variables inherited from the caller, then resolves and validates Python
-3.11 or newer before executing it in isolated mode. On Windows, the `.cmd`
-entrypoint invokes the fixed system Windows PowerShell with profiles and
-interactive input disabled; the PowerShell launcher clears the same startup
-variables, validates itself and Python, and invokes the Python source with
-`-I`. The Python runtime independently validates the complete launcher,
-dispatcher-source, interpreter, Codex-entrypoint, and Codex-runtime chains.
-Script entrypoints are invoked through the validated runtime instead of letting
-the operating system resolve them again. Passing receipts bind those paths and
-hashes, and re-hash them after the child returns.
+3.11 or newer before executing it in isolated mode. On Windows, the installed
+dispatcher ships as an owner-validated PowerShell script plus a non-executable
+Python source file. The script clears the same startup variables, validates
+itself and Python, and invokes the Python source with `-I`; it runs in the
+caller's PowerShell session, so any profile already loaded there remains inside
+the caller trust boundary. The Python runtime independently validates the
+complete launcher, dispatcher-source, interpreter, Codex-entrypoint, and
+Codex-runtime chains. Windows requires a native Codex executable and rejects
+`.cmd` and `.bat` entrypoints before launch. POSIX script entrypoints are
+invoked through the validated runtime instead of letting the operating system
+resolve them again. Passing receipts bind those paths and hashes, and re-hash
+them after the child returns.
 
 Codex subprocesses receive an explicit environment containing the validated
 user home and `CODEX_HOME` plus a narrow platform allowlist that includes

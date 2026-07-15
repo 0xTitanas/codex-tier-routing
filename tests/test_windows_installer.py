@@ -110,6 +110,8 @@ class WindowsInstallerTests(unittest.TestCase):
                 "powershell.exe",
                 "-NoLogo",
                 "-NoProfile",
+                "-ExecutionPolicy",
+                "Bypass",
                 "-Command",
                 "codex-tier",
                 *arguments,
@@ -141,11 +143,29 @@ class WindowsInstallerTests(unittest.TestCase):
     def installed_bytes(self) -> dict[str, bytes]:
         paths = [self.home / "agents" / name for name in sorted(AGENTS)]
         paths += [
-            self.home / "bin" / "codex-tier.cmd",
-            self.home / "bin" / "codex-tier-launcher.ps1",
+            self.home / "bin" / "codex-tier.ps1",
             self.home / "bin" / "codex-tier.py",
         ]
         return {str(path.relative_to(self.home)): path.read_bytes() for path in paths}
+
+    def seed_legacy_launchers(self) -> dict[str, bytes]:
+        legacy = {
+            "codex-tier.cmd": b"@echo legacy command launcher\r\n",
+            "codex-tier-launcher.ps1": b"Write-Output 'legacy PowerShell launcher'\r\n",
+        }
+        for name, content in legacy.items():
+            (self.home / "bin" / name).write_bytes(content)
+        return legacy
+
+    def fake_codex(self) -> Path:
+        from pip._vendor.distlib.scripts import ScriptMaker
+
+        maker = ScriptMaker(None, str(self.base))
+        maker.executable = sys.executable
+        maker.script_template = 'print("multi_agent stable false")\n'
+        maker.variants = {""}
+        maker.clobber = True
+        return Path(maker.make("fake-codex = fixture:main")[0])
 
     def test_fresh_install_command_routes_upgrade_backup_and_custom_profile(
         self,
@@ -211,6 +231,48 @@ class WindowsInstallerTests(unittest.TestCase):
                     list(self.home.glob(".codex-tier-routing-transaction.*"))
                 )
 
+    def test_upgrade_removes_and_backs_up_legacy_launchers(self) -> None:
+        first = self.install()
+        self.assertEqual(first.returncode, 0, first.stdout + first.stderr)
+        legacy = self.seed_legacy_launchers()
+
+        dry = self.install("-DryRun")
+        self.assertEqual(dry.returncode, 0, dry.stdout + dry.stderr)
+        for name in legacy:
+            self.assertIn(
+                f"Would remove legacy launcher: {self.home / 'bin' / name}",
+                dry.stdout,
+            )
+
+        upgrade = self.install()
+        self.assertEqual(upgrade.returncode, 0, upgrade.stdout + upgrade.stderr)
+        for name, content in legacy.items():
+            self.assertFalse((self.home / "bin" / name).exists())
+            backups = list(
+                (self.home / ".codex-tier-routing-backups").glob(
+                    f"*/snapshot/bin/{name}"
+                )
+            )
+            self.assertEqual(len(backups), 1)
+            self.assertEqual(backups[0].read_bytes(), content)
+
+    def test_rollback_restores_legacy_launchers(self) -> None:
+        first = self.install()
+        self.assertEqual(first.returncode, 0, first.stdout + first.stderr)
+        legacy = self.seed_legacy_launchers()
+        fault_root = self.fault_build()
+        for point in ("after-legacy-1", "backup-promotion"):
+            with self.subTest(point=point):
+                env = os.environ.copy()
+                env["CODEX_TIER_INSTALL_TEST_FAIL_POINT"] = point
+                failed = self.install(root=fault_root, env=env)
+                self.assertNotEqual(failed.returncode, 0)
+                for name, content in legacy.items():
+                    self.assertEqual((self.home / "bin" / name).read_bytes(), content)
+                self.assertFalse(
+                    list(self.home.glob(".codex-tier-routing-transaction.*"))
+                )
+
     def test_expandable_user_path_kind_survives_install_and_rollback(self) -> None:
         original = r"%USERPROFILE%\codex-tier-expandable-fixture"
         self.set_user_path(original, winreg.REG_EXPAND_SZ)
@@ -241,11 +303,26 @@ class WindowsInstallerTests(unittest.TestCase):
         env = os.environ.copy()
         env["CODEX_TIER_INSTALL_TEST_FAIL_POINT"] = "strict-enable-succeeded"
         env["CODEX_TIER_PYTHON_BIN"] = sys.executable
+        fake_codex = self.fake_codex()
+        env["CODEX_TIER_CODEX_BIN"] = str(fake_codex)
         result = self.install("-Strict", root=fault_root, env=env)
         self.assertNotEqual(result.returncode, 0)
+        self.assertIn(
+            "injected installer failure at strict-enable-succeeded",
+            result.stdout + result.stderr,
+        )
         self.assertEqual(self.installed_bytes(), expected)
         self.assertFalse((self.home / "tier-routing" / "strict-config.json").exists())
         self.assertFalse((self.home / "tier-routing" / "strict-config.backup").exists())
+
+    def test_strict_install_succeeds_with_fake_codex(self) -> None:
+        fake_codex = self.fake_codex()
+        env = os.environ.copy()
+        env["CODEX_TIER_PYTHON_BIN"] = sys.executable
+        env["CODEX_TIER_CODEX_BIN"] = str(fake_codex)
+        result = self.install("-Strict", env=env)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertTrue((self.home / "tier-routing" / "strict-config.json").is_file())
 
     def test_arbitrary_untrusted_acl_and_reparse_points_are_rejected(self) -> None:
         self.home.mkdir()

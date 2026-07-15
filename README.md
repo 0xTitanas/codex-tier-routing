@@ -88,6 +88,9 @@ parent may also remain single-agent when delegation is unnecessary.
 - [Git](https://git-scm.com/downloads/)
 - An installed [Codex CLI](https://developers.openai.com/codex/cli) with
   `codex exec`
+- On Windows, a native `codex.exe` entrypoint. Windows `.cmd` and `.bat`
+  wrappers are outside the tested trust boundary and are rejected before
+  dispatch.
 - A working Codex login for that CLI
 - Access to the configured model names
 - macOS, x86-64 Ubuntu 22.04, 24.04, or 26.04 LTS, or native Windows 11. With
@@ -99,8 +102,8 @@ See [compatibility](docs/compatibility.md) for the tested boundary.
 
 ## Quick start
 
-Install the prerequisites above and sign in to Codex. These checks should all
-succeed, and the first must report Python 3.11 or newer:
+Install the prerequisites above and sign in to Codex. On macOS or Linux, these
+checks should all succeed, and the first must report Python 3.11 or newer:
 
 ```sh
 python3 --version
@@ -117,8 +120,8 @@ git clone https://github.com/0xTitanas/codex-tier-routing.git
 cd codex-tier-routing
 ```
 
-Review `install.sh`, validate the package, and preview the strict installation
-without changing your Codex home:
+On macOS or Linux, review `install.sh`, validate the package, and preview the
+strict installation without changing your Codex home:
 
 ```sh
 python3 scripts/validate.py
@@ -134,16 +137,28 @@ If both commands pass, install into `${CODEX_HOME:-$HOME/.codex}`:
 On Windows, use PowerShell from the repository root:
 
 ```powershell
+python --version
+git --version
+$codexPath = (Get-Command codex -CommandType Application -ErrorAction Stop | Select-Object -First 1).Source
+if ([IO.Path]::GetExtension($codexPath) -ne '.exe') { throw 'codex-tier requires a native codex.exe on Windows' }
+& $codexPath --version
+& $codexPath login status
 python scripts\validate.py
-.\install.ps1 -Strict -DryRun
-.\install.ps1 -Strict
-& "$env:USERPROFILE\.codex\bin\codex-tier.cmd" probe
+powershell.exe -NoLogo -NoProfile -ExecutionPolicy Bypass -File .\install.ps1 -Strict -DryRun
+powershell.exe -NoLogo -NoProfile -ExecutionPolicy Bypass -File .\install.ps1 -Strict
+powershell.exe -NoLogo -NoProfile -ExecutionPolicy Bypass -File "$env:USERPROFILE\.codex\bin\codex-tier.ps1" probe
 ```
+
+If the Windows login check reports that you are signed out, run
+`& $codexPath login` and complete the sign-in flow before installing.
 
 The native installer uses owner-only ACLs, transactional rollback, and
 timestamped collision backups. It adds the install `bin` directory to the user
 `PATH`; open a fresh interactive console or RDP session before invoking
 `codex-tier` by name.
+
+The commands above use a process-scoped execution-policy override. The
+installer does not change the user's or machine's execution policy.
 
 On macOS and Linux, keep the exact uninstall command printed at the end.
 Restart every Codex surface using that home, open a new session, and verify the
@@ -173,6 +188,22 @@ raise SystemExit(not passed)
 '
 ```
 
+On Windows, run the equivalent canary from a fresh interactive PowerShell
+console or RDP session:
+
+```powershell
+$launcher = "$env:USERPROFILE\.codex\bin\codex-tier.ps1"
+$raw = 'Reply exactly ROUTE_CANARY_OK. Do not inspect files.' | powershell.exe -NoLogo -NoProfile -ExecutionPolicy Bypass -File $launcher dispatch --route scout --workdir (Get-Location).Path
+$dispatchExit = $LASTEXITCODE
+$envelope = $raw | ConvertFrom-Json
+$passed = $dispatchExit -eq 0 -and $envelope.receipt.status -eq 'pass' -and $envelope.result -eq 'ROUTE_CANARY_OK'
+if (-not $passed) {
+    $envelope | ConvertTo-Json -Depth 20
+    throw 'Canary failed.'
+}
+'Canary passed.'
+```
+
 Continue only when the verifier prints `Canary passed.` It requires both a
 passing receipt and the exact expected result. The receipt shows what the local
 Codex host recorded; it does not prove provider-side model identity or that
@@ -192,7 +223,7 @@ The strict installer copies:
 - `bin/codex-tier` and `bin/codex-tier.py` to `$CODEX_HOME/bin/`
 
 On Windows, `install.ps1` copies the same six profiles and skill plus
-`codex-tier.cmd`, `codex-tier-launcher.ps1`, and `codex-tier.py` to the
+`codex-tier.ps1` and `codex-tier.py` to the
 corresponding `%CODEX_HOME%` directories.
 
 When native generic subagent spawning is not already disabled, it also updates
@@ -331,7 +362,7 @@ Treat every `HALT` as a failed setup or dispatch; do not continue past it.
   canary. The dispatcher does not silently fall back to another model.
 - If `codex-tier` is not found on macOS or Linux, invoke it through the full
   path shown throughout this README. On Windows, open a new shell after install
-  or invoke `%CODEX_HOME%\bin\codex-tier.cmd` directly.
+  or invoke `& "$env:CODEX_HOME\bin\codex-tier.ps1"` directly.
 
 ## Security boundary
 
@@ -344,8 +375,10 @@ The installer and dispatcher:
 - validate lexical and resolved Python interpreter paths before strict installation;
 - start strict-mode Python processes with a minimal environment;
 - launch the installed dispatcher through a hardened `/bin/sh` wrapper on
-  POSIX or a profile-free PowerShell launcher on Windows; both clear Python
+  POSIX or an owner-validated PowerShell script on Windows; both clear Python
   startup variables before resolving the interpreter;
+- require a native Codex executable on Windows and reject `.cmd` and `.bat`
+  entrypoints before dispatch;
 - invoke script-based POSIX Codex entrypoints through an independently validated
   shebang runtime instead of allowing the kernel to resolve it again;
 - bind launcher, dispatcher source, Python interpreter, Codex entrypoint, and
@@ -437,8 +470,7 @@ ruff format --check scripts tests bin/codex-tier.py
 
 - [`agents/`](agents/): six Codex agent profiles
 - [`bin/codex-tier`](bin/codex-tier): hardened POSIX launcher
-- [`bin/codex-tier.cmd`](bin/codex-tier.cmd): native Windows command shim
-- [`bin/codex-tier-launcher.ps1`](bin/codex-tier-launcher.ps1): hardened PowerShell launcher
+- [`bin/codex-tier.ps1`](bin/codex-tier.ps1): hardened native Windows launcher
 - [`bin/codex-tier.py`](bin/codex-tier.py): local dispatcher runtime
 - [`skills/model-routing/SKILL.md`](skills/model-routing/SKILL.md): routing policy
 - [`schemas/local-dispatch-receipt.schema.json`](schemas/local-dispatch-receipt.schema.json): receipt contract

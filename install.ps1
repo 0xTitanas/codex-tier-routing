@@ -375,8 +375,7 @@ foreach ($agent in $agentNames) {
 }
 foreach ($artifact in @(
     @('skills\model-routing', 'skills\model-routing'),
-    @('bin\codex-tier.cmd', 'bin\codex-tier.cmd'),
-    @('bin\codex-tier-launcher.ps1', 'bin\codex-tier-launcher.ps1'),
+    @('bin\codex-tier.ps1', 'bin\codex-tier.ps1'),
     @('bin\codex-tier.py', 'bin\codex-tier.py')
 )) {
     $entries += [pscustomobject]@{
@@ -384,6 +383,15 @@ foreach ($artifact in @(
         Destination = Join-Path $CodexHome $artifact[1]
         Relative = $artifact[1]
         Stage = $null
+        Applied = $false
+        HadOriginal = $false
+    }
+}
+$legacyEntries = @()
+foreach ($legacyArtifact in @('bin\codex-tier.cmd', 'bin\codex-tier-launcher.ps1')) {
+    $legacyEntries += [pscustomobject]@{
+        Destination = Join-Path $CodexHome $legacyArtifact
+        Relative = $legacyArtifact
         Applied = $false
         HadOriginal = $false
     }
@@ -396,6 +404,11 @@ if ($DryRun) {
     Write-Output 'Dry run enabled: no filesystem changes will be made.'
     foreach ($entry in $entries) {
         Write-Output "Would install: $($entry.Source) -> $($entry.Destination)"
+    }
+    foreach ($entry in $legacyEntries) {
+        if (Test-Path -LiteralPath $entry.Destination) {
+            Write-Output "Would remove legacy launcher: $($entry.Destination)"
+        }
     }
     if ($Strict) {
         Write-Output 'Would enable strict routing'
@@ -437,6 +450,12 @@ try {
             $entry.HadOriginal = $true
         }
     }
+    foreach ($entry in $legacyEntries) {
+        if (Test-Path -LiteralPath $entry.Destination) {
+            Assert-SafeTree $entry.Destination 'legacy launcher'
+            $entry.HadOriginal = $true
+        }
+    }
 
     for ($index = 0; $index -lt $entries.Count; $index++) {
         $entry = $entries[$index]
@@ -451,9 +470,19 @@ try {
         Assert-SafeTree $entry.Destination 'installed artifact'
         Invoke-TestFailure "after-replacement-$($index + 1)"
     }
+    for ($index = 0; $index -lt $legacyEntries.Count; $index++) {
+        $entry = $legacyEntries[$index]
+        if ($entry.HadOriginal) {
+            $original = Join-Path $snapshotRoot $entry.Relative
+            New-PrivateDirectoryChain ([IO.Path]::GetDirectoryName($original))
+            Move-SafePath $entry.Destination $original
+            $entry.Applied = $true
+            Invoke-TestFailure "after-legacy-$($index + 1)"
+        }
+    }
 
     $env:CODEX_HOME = $CodexHome
-    $launcher = Join-Path $CodexHome 'bin\codex-tier-launcher.ps1'
+    $launcher = Join-Path $CodexHome 'bin\codex-tier.ps1'
     $versionOutput = & $launcher --version 2>&1
     if ($LASTEXITCODE -ne 0 -or @($versionOutput).Count -ne 1 -or $versionOutput -notmatch '^codex-tier 1\.1\.0-rc\.1$') {
         Fail 'installed launcher verification failed'
@@ -488,7 +517,7 @@ try {
         Set-UserPathState (($pathParts + $bin) -join ';') $oldUserPathState.Kind $true
     }
 
-    $hasOriginals = [bool]($entries | Where-Object { $_.HadOriginal } | Select-Object -First 1)
+    $hasOriginals = [bool](($entries + $legacyEntries) | Where-Object { $_.HadOriginal } | Select-Object -First 1)
     if ($hasOriginals) {
         $backupParent = Join-Path $CodexHome '.codex-tier-routing-backups'
         New-PrivateDirectoryChain $backupParent
@@ -514,7 +543,7 @@ try {
     $rollbackFailed = $false
     if ($strictCleanupNeeded) {
         try {
-            $strictLauncher = Join-Path $CodexHome 'bin\codex-tier-launcher.ps1'
+            $strictLauncher = Join-Path $CodexHome 'bin\codex-tier.ps1'
             & $strictLauncher strict-disable | Out-Null
             if ($LASTEXITCODE -ne 0) {
                 $rollbackFailed = $true
@@ -523,8 +552,9 @@ try {
             $rollbackFailed = $true
         }
     }
-    for ($index = $entries.Count - 1; $index -ge 0; $index--) {
-        $entry = $entries[$index]
+    $transactionEntries = @($entries + $legacyEntries)
+    for ($index = $transactionEntries.Count - 1; $index -ge 0; $index--) {
+        $entry = $transactionEntries[$index]
         if (-not $entry.Applied) {
             continue
         }
