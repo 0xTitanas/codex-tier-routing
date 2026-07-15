@@ -13,7 +13,6 @@ import argparse
 import copy
 from contextlib import nullcontext
 import difflib
-import fcntl
 import hashlib
 import json
 import os
@@ -26,6 +25,7 @@ import stat
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 import tomllib
 import uuid
@@ -33,6 +33,13 @@ from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
+
+if os.name == "nt":
+    import ctypes
+    import msvcrt
+    from ctypes import wintypes
+else:
+    import fcntl
 
 
 SCHEMA = "codex-tier-routing/local-dispatch-receipt/v2"
@@ -214,6 +221,545 @@ class DispatchHalt(RuntimeError):
     """A fail-closed dispatch outcome."""
 
 
+if os.name == "nt":
+    _ADVAPI32 = ctypes.WinDLL("advapi32", use_last_error=True)
+    _KERNEL32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    _KERNEL32.GetCurrentProcess.restype = wintypes.HANDLE
+    _KERNEL32.GetFileAttributesW.argtypes = [wintypes.LPCWSTR]
+    _KERNEL32.GetFileAttributesW.restype = wintypes.DWORD
+    _KERNEL32.MoveFileExW.argtypes = [
+        wintypes.LPCWSTR,
+        wintypes.LPCWSTR,
+        wintypes.DWORD,
+    ]
+    _KERNEL32.MoveFileExW.restype = wintypes.BOOL
+    _KERNEL32.CloseHandle.argtypes = [wintypes.HANDLE]
+    _KERNEL32.CloseHandle.restype = wintypes.BOOL
+    _KERNEL32.LocalFree.argtypes = [wintypes.HLOCAL]
+    _KERNEL32.LocalFree.restype = wintypes.HLOCAL
+    _ADVAPI32.OpenProcessToken.argtypes = [
+        wintypes.HANDLE,
+        wintypes.DWORD,
+        ctypes.POINTER(wintypes.HANDLE),
+    ]
+    _ADVAPI32.OpenProcessToken.restype = wintypes.BOOL
+    _ADVAPI32.GetTokenInformation.argtypes = [
+        wintypes.HANDLE,
+        ctypes.c_int,
+        wintypes.LPVOID,
+        wintypes.DWORD,
+        ctypes.POINTER(wintypes.DWORD),
+    ]
+    _ADVAPI32.GetTokenInformation.restype = wintypes.BOOL
+    _ADVAPI32.ConvertSidToStringSidW.argtypes = [
+        wintypes.LPVOID,
+        ctypes.POINTER(wintypes.LPWSTR),
+    ]
+    _ADVAPI32.ConvertSidToStringSidW.restype = wintypes.BOOL
+
+    class _SidAndAttributes(ctypes.Structure):
+        _fields_ = [("sid", wintypes.LPVOID), ("attributes", wintypes.DWORD)]
+
+    class _TokenUser(ctypes.Structure):
+        _fields_ = [("user", _SidAndAttributes)]
+
+    class _AceHeader(ctypes.Structure):
+        _fields_ = [
+            ("type", ctypes.c_ubyte),
+            ("flags", ctypes.c_ubyte),
+            ("size", wintypes.WORD),
+        ]
+
+    class _AclSizeInformation(ctypes.Structure):
+        _fields_ = [
+            ("ace_count", wintypes.DWORD),
+            ("acl_bytes_in_use", wintypes.DWORD),
+            ("acl_bytes_free", wintypes.DWORD),
+        ]
+
+    class _Overlapped(ctypes.Structure):
+        _fields_ = [
+            ("internal", ctypes.c_size_t),
+            ("internal_high", ctypes.c_size_t),
+            ("offset", wintypes.DWORD),
+            ("offset_high", wintypes.DWORD),
+            ("event", wintypes.HANDLE),
+        ]
+
+    class _JobBasicLimits(ctypes.Structure):
+        _fields_ = [
+            ("per_process_user_time", ctypes.c_int64),
+            ("per_job_user_time", ctypes.c_int64),
+            ("limit_flags", wintypes.DWORD),
+            ("minimum_working_set", ctypes.c_size_t),
+            ("maximum_working_set", ctypes.c_size_t),
+            ("active_process_limit", wintypes.DWORD),
+            ("affinity", ctypes.c_size_t),
+            ("priority_class", wintypes.DWORD),
+            ("scheduling_class", wintypes.DWORD),
+        ]
+
+    class _IoCounters(ctypes.Structure):
+        _fields_ = [
+            ("read_operation_count", ctypes.c_uint64),
+            ("write_operation_count", ctypes.c_uint64),
+            ("other_operation_count", ctypes.c_uint64),
+            ("read_transfer_count", ctypes.c_uint64),
+            ("write_transfer_count", ctypes.c_uint64),
+            ("other_transfer_count", ctypes.c_uint64),
+        ]
+
+    class _JobExtendedLimits(ctypes.Structure):
+        _fields_ = [
+            ("basic", _JobBasicLimits),
+            ("io", _IoCounters),
+            ("process_memory_limit", ctypes.c_size_t),
+            ("job_memory_limit", ctypes.c_size_t),
+            ("peak_process_memory", ctypes.c_size_t),
+            ("peak_job_memory", ctypes.c_size_t),
+        ]
+
+    class _ThreadEntry32(ctypes.Structure):
+        _fields_ = [
+            ("size", wintypes.DWORD),
+            ("usage", wintypes.DWORD),
+            ("thread_id", wintypes.DWORD),
+            ("owner_process_id", wintypes.DWORD),
+            ("base_priority", wintypes.LONG),
+            ("priority_delta", wintypes.LONG),
+            ("flags", wintypes.DWORD),
+        ]
+
+    _ADVAPI32.GetNamedSecurityInfoW.argtypes = [
+        wintypes.LPWSTR,
+        wintypes.DWORD,
+        wintypes.DWORD,
+        ctypes.POINTER(wintypes.LPVOID),
+        ctypes.POINTER(wintypes.LPVOID),
+        ctypes.POINTER(wintypes.LPVOID),
+        ctypes.POINTER(wintypes.LPVOID),
+        ctypes.POINTER(wintypes.LPVOID),
+    ]
+    _ADVAPI32.GetNamedSecurityInfoW.restype = wintypes.DWORD
+    _ADVAPI32.GetAclInformation.argtypes = [
+        wintypes.LPVOID,
+        wintypes.LPVOID,
+        wintypes.DWORD,
+        ctypes.c_int,
+    ]
+    _ADVAPI32.GetAclInformation.restype = wintypes.BOOL
+    _ADVAPI32.GetAce.argtypes = [
+        wintypes.LPVOID,
+        wintypes.DWORD,
+        ctypes.POINTER(wintypes.LPVOID),
+    ]
+    _ADVAPI32.GetAce.restype = wintypes.BOOL
+    _ADVAPI32.ConvertStringSecurityDescriptorToSecurityDescriptorW.argtypes = [
+        wintypes.LPCWSTR,
+        wintypes.DWORD,
+        ctypes.POINTER(wintypes.LPVOID),
+        ctypes.POINTER(wintypes.DWORD),
+    ]
+    _ADVAPI32.ConvertStringSecurityDescriptorToSecurityDescriptorW.restype = (
+        wintypes.BOOL
+    )
+    _ADVAPI32.GetSecurityDescriptorDacl.argtypes = [
+        wintypes.LPVOID,
+        ctypes.POINTER(wintypes.BOOL),
+        ctypes.POINTER(wintypes.LPVOID),
+        ctypes.POINTER(wintypes.BOOL),
+    ]
+    _ADVAPI32.GetSecurityDescriptorDacl.restype = wintypes.BOOL
+    _ADVAPI32.SetNamedSecurityInfoW.argtypes = [
+        wintypes.LPWSTR,
+        wintypes.DWORD,
+        wintypes.DWORD,
+        wintypes.LPVOID,
+        wintypes.LPVOID,
+        wintypes.LPVOID,
+        wintypes.LPVOID,
+    ]
+    _ADVAPI32.SetNamedSecurityInfoW.restype = wintypes.DWORD
+    _KERNEL32.LockFileEx.argtypes = [
+        wintypes.HANDLE,
+        wintypes.DWORD,
+        wintypes.DWORD,
+        wintypes.DWORD,
+        wintypes.DWORD,
+        ctypes.POINTER(_Overlapped),
+    ]
+    _KERNEL32.LockFileEx.restype = wintypes.BOOL
+    _KERNEL32.UnlockFileEx.argtypes = [
+        wintypes.HANDLE,
+        wintypes.DWORD,
+        wintypes.DWORD,
+        wintypes.DWORD,
+        ctypes.POINTER(_Overlapped),
+    ]
+    _KERNEL32.UnlockFileEx.restype = wintypes.BOOL
+    _KERNEL32.CreateJobObjectW.argtypes = [wintypes.LPVOID, wintypes.LPCWSTR]
+    _KERNEL32.CreateJobObjectW.restype = wintypes.HANDLE
+    _KERNEL32.SetInformationJobObject.argtypes = [
+        wintypes.HANDLE,
+        ctypes.c_int,
+        wintypes.LPVOID,
+        wintypes.DWORD,
+    ]
+    _KERNEL32.SetInformationJobObject.restype = wintypes.BOOL
+    _KERNEL32.AssignProcessToJobObject.argtypes = [wintypes.HANDLE, wintypes.HANDLE]
+    _KERNEL32.AssignProcessToJobObject.restype = wintypes.BOOL
+    _KERNEL32.TerminateJobObject.argtypes = [wintypes.HANDLE, wintypes.UINT]
+    _KERNEL32.TerminateJobObject.restype = wintypes.BOOL
+    _KERNEL32.CreateToolhelp32Snapshot.argtypes = [wintypes.DWORD, wintypes.DWORD]
+    _KERNEL32.CreateToolhelp32Snapshot.restype = wintypes.HANDLE
+    _KERNEL32.Thread32First.argtypes = [
+        wintypes.HANDLE,
+        ctypes.POINTER(_ThreadEntry32),
+    ]
+    _KERNEL32.Thread32First.restype = wintypes.BOOL
+    _KERNEL32.Thread32Next.argtypes = [
+        wintypes.HANDLE,
+        ctypes.POINTER(_ThreadEntry32),
+    ]
+    _KERNEL32.Thread32Next.restype = wintypes.BOOL
+    _KERNEL32.OpenThread.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]
+    _KERNEL32.OpenThread.restype = wintypes.HANDLE
+    _KERNEL32.ResumeThread.argtypes = [wintypes.HANDLE]
+    _KERNEL32.ResumeThread.restype = wintypes.DWORD
+
+
+_WINDOWS_TRUSTED_OWNER_SIDS = {
+    "S-1-5-18",  # LocalSystem
+    "S-1-5-32-544",  # BUILTIN\\Administrators
+    # NT SERVICE\\TrustedInstaller, the normal owner of protected OS roots.
+    "S-1-5-80-956008885-3418522649-1831038044-1853292631-2271478464",
+}
+_WINDOWS_REPARSE_POINT = 0x400
+_WINDOWS_DIRECTORY = 0x10
+_WINDOWS_CREATE_SUSPENDED = 0x00000004
+_WINDOWS_SAFE_NAME_SURROGATE_TAGS = {0xA0000003, 0xA000000C}
+_WINDOWS_INHERIT_ONLY_ACE = 0x08
+_WINDOWS_ALLOWED_ACE = 0x00
+_WINDOWS_DENIED_ACES = {0x01, 0x06, 0x0A, 0x0C}
+_WINDOWS_REPLACE_RIGHTS = 0x10000000 | 0x00080000 | 0x00040000 | 0x00010000 | 0x40
+_WINDOWS_WRITE_RIGHTS = (
+    _WINDOWS_REPLACE_RIGHTS | 0x40000000 | 0x02 | 0x04 | 0x10 | 0x100
+)
+_WINDOWS_CURRENT_SID: str | None = None
+
+
+def _windows_error(operation: str, code: int | None = None) -> OSError:
+    error = ctypes.get_last_error() if code is None else code
+    return OSError(error, f"{operation}: {ctypes.FormatError(error).strip()}")
+
+
+def _windows_sid_string(sid: int | ctypes.c_void_p) -> str:
+    converted = wintypes.LPWSTR()
+    if not _ADVAPI32.ConvertSidToStringSidW(sid, ctypes.byref(converted)):
+        raise _windows_error("unable to convert Windows SID")
+    try:
+        return converted.value
+    finally:
+        _KERNEL32.LocalFree(converted)
+
+
+def _windows_current_sid() -> str:
+    global _WINDOWS_CURRENT_SID
+    if _WINDOWS_CURRENT_SID is not None:
+        return _WINDOWS_CURRENT_SID
+    token = wintypes.HANDLE()
+    if not _ADVAPI32.OpenProcessToken(
+        _KERNEL32.GetCurrentProcess(), 0x0008, ctypes.byref(token)
+    ):
+        raise _windows_error("unable to inspect the current Windows identity")
+    try:
+        required = wintypes.DWORD()
+        _ADVAPI32.GetTokenInformation(token, 1, None, 0, ctypes.byref(required))
+        if required.value == 0:
+            raise _windows_error("unable to size the current Windows identity")
+        buffer = ctypes.create_string_buffer(required.value)
+        if not _ADVAPI32.GetTokenInformation(
+            token, 1, buffer, required, ctypes.byref(required)
+        ):
+            raise _windows_error("unable to read the current Windows identity")
+        user = ctypes.cast(buffer, ctypes.POINTER(_TokenUser)).contents
+        _WINDOWS_CURRENT_SID = _windows_sid_string(user.user.sid)
+        return _WINDOWS_CURRENT_SID
+    finally:
+        _KERNEL32.CloseHandle(token)
+
+
+def _windows_trusted_owner_sids() -> set[str]:
+    return {*_WINDOWS_TRUSTED_OWNER_SIDS, _windows_current_sid()}
+
+
+def _windows_trusted_acl_sids() -> set[str]:
+    # OWNER RIGHTS is safe only because the object's actual owner is checked
+    # against the narrower owner allowlist before any ACE is accepted.
+    return {*_windows_trusted_owner_sids(), "S-1-3-4"}
+
+
+def _windows_attributes(path: Path, *, label: str) -> int:
+    attributes = _KERNEL32.GetFileAttributesW(str(path))
+    if attributes == 0xFFFFFFFF:
+        raise DispatchHalt(f"unable to inspect {label}: {_windows_error(label)}")
+    return attributes
+
+
+def _windows_validate_acl_ace(
+    address: int, *, label: str, dangerous: int, trusted: set[str]
+) -> None:
+    header = _AceHeader.from_address(address)
+    if header.flags & _WINDOWS_INHERIT_ONLY_ACE:
+        return
+    mask = ctypes.c_uint32.from_address(address + 4).value
+    if not mask & dangerous or header.type in _WINDOWS_DENIED_ACES:
+        return
+    if header.type != _WINDOWS_ALLOWED_ACE:
+        raise DispatchHalt(f"{label} has an unverifiable Windows ACE")
+    sid = _windows_sid_string(address + 8)
+    if sid not in trusted:
+        inherited = "inherited " if header.flags & 0x10 else ""
+        raise DispatchHalt(
+            f"{label} grants {inherited}write access outside the trusted Windows identities"
+        )
+
+
+def _windows_acl(path: Path, *, label: str, final: bool) -> None:
+    owner = wintypes.LPVOID()
+    dacl = wintypes.LPVOID()
+    descriptor = wintypes.LPVOID()
+    result = _ADVAPI32.GetNamedSecurityInfoW(
+        str(path),
+        1,
+        0x00000001 | 0x00000004,
+        ctypes.byref(owner),
+        None,
+        ctypes.byref(dacl),
+        None,
+        ctypes.byref(descriptor),
+    )
+    if result:
+        raise DispatchHalt(
+            f"unable to inspect Windows ACL for {label}: {_windows_error(label, result)}"
+        )
+    try:
+        if not owner or _windows_sid_string(owner) not in _windows_trusted_owner_sids():
+            raise DispatchHalt(f"{label} has an untrusted Windows owner")
+        if not dacl:
+            raise DispatchHalt(f"{label} has an unverifiable Windows ACL")
+        information = _AclSizeInformation()
+        if not _ADVAPI32.GetAclInformation(
+            dacl,
+            ctypes.byref(information),
+            ctypes.sizeof(information),
+            2,
+        ):
+            raise DispatchHalt(f"unable to inspect Windows ACL entries for {label}")
+        dangerous = _WINDOWS_WRITE_RIGHTS if final else _WINDOWS_REPLACE_RIGHTS
+        trusted = _windows_trusted_acl_sids()
+        for index in range(information.ace_count):
+            ace = wintypes.LPVOID()
+            if not _ADVAPI32.GetAce(dacl, index, ctypes.byref(ace)):
+                raise DispatchHalt(f"unable to inspect Windows ACL entry for {label}")
+            _windows_validate_acl_ace(
+                ace.value, label=label, dangerous=dangerous, trusted=trusted
+            )
+    finally:
+        if descriptor:
+            _KERNEL32.LocalFree(descriptor)
+
+
+def _windows_lexical_chain(path: Path, *, label: str) -> list[Path]:
+    raw = str(path)
+    if raw.startswith(("\\\\", "\\?\\", "\\.\\")):
+        raise DispatchHalt(f"{label} must use a local drive path")
+    drive, remainder = os.path.splitdrive(raw)
+    if len(drive) != 2 or drive[1] != ":" or not remainder.startswith(("\\", "/")):
+        raise DispatchHalt(f"{label} must be an absolute local drive path")
+    components = [value for value in re.split(r"[\\/]+", remainder) if value]
+    for component in components:
+        if (
+            component in {".", ".."}
+            or component.endswith((" ", "."))
+            or ":" in component
+        ):
+            raise DispatchHalt(f"{label} contains an unsafe Windows path component")
+    current = Path(f"{drive}\\")
+    chain = [current]
+    for component in components:
+        current /= component
+        chain.append(current)
+    return chain
+
+
+def _windows_validate_path(
+    path: Path,
+    *,
+    label: str,
+    require_directory: bool = False,
+    require_file: bool = False,
+    allow_reparse: bool = False,
+) -> Path:
+    chain = _windows_lexical_chain(path, label=label)
+    for index, component in enumerate(chain):
+        attributes = _windows_attributes(component, label=label)
+        if attributes & _WINDOWS_REPARSE_POINT:
+            tag = getattr(os.lstat(component), "st_reparse_tag", None)
+            if not allow_reparse or tag not in _WINDOWS_SAFE_NAME_SURROGATE_TAGS:
+                raise DispatchHalt(f"{label} contains a Windows reparse point")
+        final = index == len(chain) - 1
+        if final and require_directory and not attributes & _WINDOWS_DIRECTORY:
+            raise DispatchHalt(f"{label} is not a directory")
+        if final and require_file and attributes & _WINDOWS_DIRECTORY:
+            raise DispatchHalt(f"{label} is not a regular file")
+        _windows_acl(component, label=f"{label} component {component}", final=final)
+    try:
+        resolved = path.resolve(strict=True)
+    except OSError as exc:
+        raise DispatchHalt(f"unable to resolve {label}: {path}") from exc
+    resolved_text = str(resolved)
+    if resolved_text.startswith("\\\\?\\"):
+        resolved_text = resolved_text[4:]
+        if not re.match(r"^[A-Za-z]:[\\\\/]", resolved_text):
+            raise DispatchHalt(f"resolved {label} must use a local drive path")
+        resolved = Path(resolved_text)
+    if os.path.normcase(str(resolved)) != os.path.normcase(str(path.absolute())):
+        # A non-reparse spelling can still expand an 8.3 alias. Validate the
+        # canonical target independently before accepting that identity.
+        resolved_chain = _windows_lexical_chain(resolved, label=label)
+        for index, component in enumerate(resolved_chain):
+            attributes = _windows_attributes(component, label=label)
+            if attributes & _WINDOWS_REPARSE_POINT:
+                raise DispatchHalt(f"resolved {label} contains a Windows reparse point")
+            _windows_acl(
+                component,
+                label=f"resolved {label} component {component}",
+                final=index == len(resolved_chain) - 1,
+            )
+    return resolved
+
+
+def _windows_secure_private(path: Path) -> None:
+    flags = "OICI" if path.is_dir() else ""
+    sid = _windows_current_sid()
+    sddl = f"D:P(A;{flags};FA;;;SY)(A;{flags};FA;;;BA)(A;{flags};FA;;;{sid})"
+    descriptor = wintypes.LPVOID()
+    if not _ADVAPI32.ConvertStringSecurityDescriptorToSecurityDescriptorW(
+        sddl, 1, ctypes.byref(descriptor), None
+    ):
+        raise DispatchHalt("unable to build a private Windows ACL")
+    try:
+        present = wintypes.BOOL()
+        defaulted = wintypes.BOOL()
+        dacl = wintypes.LPVOID()
+        if (
+            not _ADVAPI32.GetSecurityDescriptorDacl(
+                descriptor,
+                ctypes.byref(present),
+                ctypes.byref(dacl),
+                ctypes.byref(defaulted),
+            )
+            or not present
+        ):
+            raise DispatchHalt("unable to read a private Windows ACL")
+        result = _ADVAPI32.SetNamedSecurityInfoW(
+            str(path), 1, 0x00000004 | 0x80000000, None, None, dacl, None
+        )
+        if result:
+            raise DispatchHalt(
+                f"unable to apply a private Windows ACL: {_windows_error(str(path), result)}"
+            )
+    finally:
+        _KERNEL32.LocalFree(descriptor)
+
+
+def _stat_is_reparse(details: os.stat_result) -> bool:
+    return bool(getattr(details, "st_file_attributes", 0) & _WINDOWS_REPARSE_POINT)
+
+
+def _path_is_link(path: Path) -> bool:
+    if path.is_symlink():
+        return True
+    return bool(
+        os.name == "nt"
+        and os.path.lexists(path)
+        and _windows_attributes(path, label="path") & _WINDOWS_REPARSE_POINT
+    )
+
+
+def paths_overlap(left: Path, right: Path) -> bool:
+    """Return whether either resolved path contains the other."""
+    left_value = os.path.normcase(os.path.realpath(left))
+    right_value = os.path.normcase(os.path.realpath(right))
+    try:
+        return os.path.commonpath((left_value, right_value)) in {
+            left_value,
+            right_value,
+        }
+    except ValueError:
+        return False
+
+
+def paths_same(left: Path, right: Path) -> bool:
+    try:
+        return os.path.samefile(left, right)
+    except OSError:
+        return os.path.normcase(os.path.realpath(left)) == os.path.normcase(
+            os.path.realpath(right)
+        )
+
+
+def resolve_workdir(value: str) -> Path:
+    candidate = Path(value).expanduser()
+    if os.name == "nt":
+        if not candidate.is_absolute():
+            candidate = Path.cwd() / candidate
+        return _windows_validate_path(
+            candidate, label="workdir", require_directory=True
+        )
+    return candidate.resolve()
+
+
+def _lock_file(handle: Any, *, exclusive: bool, nonblocking: bool = False) -> None:
+    if os.name != "nt":
+        operation = fcntl.LOCK_EX if exclusive else fcntl.LOCK_SH
+        if nonblocking:
+            operation |= fcntl.LOCK_NB
+        fcntl.flock(handle.fileno(), operation)
+        return
+    overlapped = _Overlapped()
+    flags = (0x00000002 if exclusive else 0) | (0x00000001 if nonblocking else 0)
+    if _KERNEL32.LockFileEx(
+        msvcrt.get_osfhandle(handle.fileno()),
+        flags,
+        0,
+        1,
+        0,
+        ctypes.byref(overlapped),
+    ):
+        return
+    error = ctypes.get_last_error()
+    if nonblocking and error in {32, 33, 158}:
+        raise BlockingIOError(error, "Windows file lock is already held")
+    raise _windows_error("unable to acquire Windows file lock", error)
+
+
+def _unlock_file(handle: Any) -> None:
+    if os.name != "nt":
+        fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+        return
+    overlapped = _Overlapped()
+    if not _KERNEL32.UnlockFileEx(
+        msvcrt.get_osfhandle(handle.fileno()),
+        0,
+        1,
+        0,
+        ctypes.byref(overlapped),
+    ):
+        raise _windows_error("unable to release Windows file lock")
+
+
 def utc_now() -> str:
     return datetime.now(UTC).isoformat().replace("+00:00", "Z")
 
@@ -258,14 +804,31 @@ def child_environment(home: Path) -> dict[str, str]:
     dispatcher resolves and validates the Codex entrypoint and its shebang
     runtime explicitly before launch rather than trusting that path.
     """
-    configured_home = os.environ.get("HOME")
+    configured_home = os.environ.get("USERPROFILE" if os.name == "nt" else "HOME")
     if not configured_home or not Path(configured_home).is_absolute():
-        raise DispatchHalt("HOME must be an absolute path")
+        raise DispatchHalt("user home must be an absolute path")
     user_home = validate_executable_chain(
         Path(configured_home), label="HOME path", require_directory=True
     )
     environment = {"HOME": str(user_home), "CODEX_HOME": str(home)}
-    for name in ("PATH", "TERM", "LANG", "LC_ALL"):
+    allowed = ["PATH", "TERM", "LANG", "LC_ALL"]
+    if os.name == "nt":
+        allowed.extend(
+            [
+                "USERPROFILE",
+                "HOMEDRIVE",
+                "HOMEPATH",
+                "SystemRoot",
+                "WINDIR",
+                "COMSPEC",
+                "PATHEXT",
+                "TEMP",
+                "TMP",
+                "APPDATA",
+                "LOCALAPPDATA",
+            ]
+        )
+    for name in allowed:
         value = os.environ.get(name)
         if value is not None:
             environment[name] = value
@@ -332,6 +895,34 @@ def validate_ledger_lines(handle: Any) -> str | None:
 
 
 def ensure_private_dir(path: Path) -> None:
+    if os.name == "nt":
+        if path.exists():
+            _windows_validate_path(
+                path, label="private directory", require_directory=True
+            )
+        else:
+            missing = []
+            current = path
+            while not current.exists():
+                missing.append(current)
+                current = current.parent
+            _windows_validate_path(
+                current, label="private directory parent", require_directory=True
+            )
+            for directory in reversed(missing):
+                try:
+                    directory.mkdir()
+                except FileExistsError:
+                    _windows_validate_path(
+                        directory,
+                        label="concurrently created private directory",
+                        require_directory=True,
+                    )
+                else:
+                    _windows_secure_private(directory)
+        _windows_secure_private(path)
+        _windows_validate_path(path, label="private directory", require_directory=True)
+        return
     if path.is_symlink():
         raise DispatchHalt(f"refusing symlinked private directory: {path}")
     path.mkdir(mode=0o700, parents=True, exist_ok=True)
@@ -367,6 +958,13 @@ def reject_darwin_allow_acl(path: Path, *, label: str) -> None:
 def preflight_home(path: Path, *, lexical: str | None = None) -> Path:
     """Validate the complete lexical home chain before resolving the path."""
     raw = str(path) if lexical is None else lexical
+    if os.name == "nt":
+        candidate = Path(raw)
+        if not raw or not candidate.is_absolute():
+            raise DispatchHalt("CODEX_HOME must be an absolute path")
+        return _windows_validate_path(
+            candidate, label="Codex home", require_directory=True
+        )
     if not raw or not Path(raw).is_absolute():
         raise DispatchHalt("CODEX_HOME must be an absolute path")
     components = [component for component in raw.split("/") if component]
@@ -425,6 +1023,14 @@ def validate_executable_chain(
     same operating-system identity. Symlinks are allowed only when both their
     lexical containment and resolved target chains pass these checks.
     """
+    if os.name == "nt":
+        return _windows_validate_path(
+            path,
+            label=label,
+            require_directory=require_directory,
+            require_file=not require_directory,
+            allow_reparse=True,
+        )
     raw = str(path)
     if not raw or not path.is_absolute():
         raise DispatchHalt(f"{label} must be an absolute path")
@@ -481,7 +1087,12 @@ def preflight_ledger(home: Path) -> None:
     ledger_dir = home / "tier-routing"
     ensure_private_dir(ledger_dir)
     ledger = ledger_dir / "ledger.jsonl"
-    if ledger.is_symlink():
+    if ledger.is_symlink() or (
+        os.name == "nt"
+        and os.path.lexists(ledger)
+        and _windows_attributes(ledger, label="local receipt ledger")
+        & _WINDOWS_REPARSE_POINT
+    ):
         raise DispatchHalt("refusing symlinked local receipt ledger")
     if ledger.exists():
         current_owner_regular(ledger, label="local receipt ledger")
@@ -493,11 +1104,15 @@ def preflight_ledger(home: Path) -> None:
                 f"unable to open local receipt ledger safely: {type(exc).__name__}"
             ) from exc
         with os.fdopen(descriptor, "r", encoding="utf-8") as handle:
-            fcntl.flock(handle.fileno(), fcntl.LOCK_SH)
-            if os.fstat(handle.fileno()).st_size > MAX_LEDGER_BYTES:
-                raise DispatchHalt("local receipt ledger exceeds the total size limit")
-            validate_ledger_lines(handle)
-            fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+            _lock_file(handle, exclusive=False)
+            try:
+                if os.fstat(handle.fileno()).st_size > MAX_LEDGER_BYTES:
+                    raise DispatchHalt(
+                        "local receipt ledger exceeds the total size limit"
+                    )
+                validate_ledger_lines(handle)
+            finally:
+                _unlock_file(handle)
 
 
 def _read_shebang(path: Path) -> list[str] | None:
@@ -649,6 +1264,9 @@ def strict_paths(home: Path) -> tuple[Path, Path, Path]:
 
 
 def current_owner_regular(path: Path, *, label: str) -> os.stat_result:
+    if os.name == "nt":
+        resolved = _windows_validate_path(path, label=label, require_file=True)
+        return resolved.stat()
     if path.is_symlink():
         raise DispatchHalt(f"refusing symlinked {label}")
     details = path.stat()
@@ -660,8 +1278,32 @@ def current_owner_regular(path: Path, *, label: str) -> os.stat_result:
     return details
 
 
+def windows_sandbox_mode(home: Path) -> str:
+    """Preserve an explicit elevated sandbox, otherwise use the native fallback."""
+    config = home / "config.toml"
+    if _path_is_link(config):
+        raise DispatchHalt("refusing reparse-point config.toml")
+    if not config.exists():
+        return "unelevated"
+    current_owner_regular(config, label="config.toml")
+    try:
+        parsed = tomllib.loads(config.read_text(encoding="utf-8"))
+    except (OSError, UnicodeError, tomllib.TOMLDecodeError) as exc:
+        raise DispatchHalt("unable to read the Windows sandbox configuration") from exc
+    windows = parsed.get("windows", {})
+    if not isinstance(windows, dict):
+        raise DispatchHalt("Windows sandbox configuration must be a table")
+    mode = windows.get("sandbox", "unelevated")
+    if mode not in {"elevated", "unelevated"}:
+        raise DispatchHalt("Windows sandbox must be elevated or unelevated")
+    return mode
+
+
 def private_existing_dir(path: Path, *, label: str) -> None:
     """Require an existing owner-only directory without changing its mode."""
+    if os.name == "nt":
+        _windows_validate_path(path, label=label, require_directory=True)
+        return
     if path.is_symlink():
         raise DispatchHalt(f"refusing symlinked {label}")
     try:
@@ -743,8 +1385,9 @@ def load_policy(home: Path) -> RoutingPolicy:
         return default_policy()
     except OSError as exc:
         raise DispatchHalt("unable to inspect routing policy") from exc
-    if stat.S_ISLNK(details.st_mode):
+    if stat.S_ISLNK(details.st_mode) or _stat_is_reparse(details):
         raise DispatchHalt("refusing symlinked routing policy")
+    expected = current_owner_regular(path, label="routing policy")
     flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
     try:
         descriptor = os.open(path, flags)
@@ -754,9 +1397,15 @@ def load_policy(home: Path) -> RoutingPolicy:
         ) from exc
     try:
         details = os.fstat(descriptor)
-        if not stat.S_ISREG(details.st_mode) or details.st_uid != os.geteuid():
+        if not stat.S_ISREG(details.st_mode):
             raise DispatchHalt("routing policy is not a current-owner regular file")
-        if stat.S_IMODE(details.st_mode) & 0o077:
+        if os.name == "nt" and (
+            details.st_dev != expected.st_dev or details.st_ino != expected.st_ino
+        ):
+            raise DispatchHalt("routing policy changed during safe open")
+        if os.name != "nt" and details.st_uid != os.geteuid():
+            raise DispatchHalt("routing policy is not a current-owner regular file")
+        if os.name != "nt" and stat.S_IMODE(details.st_mode) & 0o077:
             raise DispatchHalt(
                 "routing policy must not grant group/other permissions (use mode 0600)"
             )
@@ -798,18 +1447,28 @@ def atomic_write(path: Path, data: bytes, mode: int) -> None:
     descriptor = None
     try:
         descriptor = os.open(temporary, flags, mode)
+        if os.name == "nt":
+            _windows_secure_private(temporary)
         with os.fdopen(descriptor, "wb") as handle:
             descriptor = None
-            os.fchmod(handle.fileno(), mode)
+            if os.name != "nt":
+                os.fchmod(handle.fileno(), mode)
             handle.write(data)
             handle.flush()
             os.fsync(handle.fileno())
-        os.replace(temporary, path)
-        directory = os.open(path.parent, os.O_RDONLY)
-        try:
-            os.fsync(directory)
-        finally:
-            os.close(directory)
+        if os.name == "nt":
+            if not _KERNEL32.MoveFileExW(str(temporary), str(path), 0x1 | 0x8):
+                raise _windows_error("unable to replace private Windows file")
+            _windows_validate_path(
+                path, label="strict configuration", require_file=True
+            )
+        else:
+            os.replace(temporary, path)
+            directory = os.open(path.parent, os.O_RDONLY)
+            try:
+                os.fsync(directory)
+            finally:
+                os.close(directory)
     except OSError as exc:
         if descriptor is not None:
             os.close(descriptor)
@@ -1058,7 +1717,7 @@ def strict_enable(_: argparse.Namespace, home: Path | None = None) -> int:
     config = home / "config.toml"
     # exists() is false for dangling links, so reject either form before every
     # config existence, read, or recovery decision below.
-    if config.is_symlink():
+    if _path_is_link(config):
         raise DispatchHalt("refusing symlinked config.toml")
     _, manifest_path, backup = strict_paths(home)
     reject_profile_overrides(home)
@@ -1137,7 +1796,7 @@ def strict_enable(_: argparse.Namespace, home: Path | None = None) -> int:
     except BaseException as cause:
         rollback_blocked = False
         try:
-            if config.is_symlink():
+            if _path_is_link(config):
                 rollback_blocked = True
                 current_exists = True
                 current = b""
@@ -1150,7 +1809,7 @@ def strict_enable(_: argparse.Namespace, home: Path | None = None) -> int:
                 current = b""
         except (OSError, DispatchHalt):
             rollback_blocked = True
-            current_exists = config.exists() or config.is_symlink()
+            current_exists = config.exists() or _path_is_link(config)
             current = b""
 
         current_hash = sha256_bytes(current)
@@ -1205,7 +1864,7 @@ def strict_disable(_: argparse.Namespace, home: Path | None = None) -> int:
     # recovery operation, and strict_paths creates/chmods tier-routing.
     # is_symlink covers both live and dangling links.
     config = home / "config.toml"
-    if config.is_symlink():
+    if _path_is_link(config):
         raise DispatchHalt("refusing symlinked config.toml")
     config, manifest_path, backup = strict_paths(home)
     manifest = read_strict_manifest(manifest_path)
@@ -1215,7 +1874,7 @@ def strict_disable(_: argparse.Namespace, home: Path | None = None) -> int:
         )
         return 0
     original, managed = strict_managed_versions(manifest, backup)
-    if config.is_symlink():
+    if _path_is_link(config):
         raise DispatchHalt("refusing symlinked config.toml")
     if config.exists():
         current_details = current_owner_regular(config, label="config.toml")
@@ -1240,7 +1899,7 @@ def strict_disable(_: argparse.Namespace, home: Path | None = None) -> int:
 
     # Re-read after recording the disabling state so changes already visible at
     # this recovery boundary are preserved or rejected.
-    if config.is_symlink():
+    if _path_is_link(config):
         raise DispatchHalt("refusing symlinked config.toml")
     if config.exists():
         current_details = current_owner_regular(config, label="config.toml")
@@ -1295,9 +1954,13 @@ class Slot:
                     f"unable to open dispatch lock safely: {type(exc).__name__}"
                 ) from exc
             handle = os.fdopen(descriptor, "a+")
-            os.fchmod(handle.fileno(), 0o600)
+            if os.name == "nt":
+                _windows_secure_private(path)
+                current_owner_regular(path, label="dispatch lock")
+            else:
+                os.fchmod(handle.fileno(), 0o600)
             try:
-                fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+                _lock_file(handle, exclusive=True, nonblocking=True)
             except BlockingIOError:
                 handle.close()
                 continue
@@ -1307,12 +1970,22 @@ class Slot:
 
     def __exit__(self, *_: object) -> None:
         if self._file is not None:
-            fcntl.flock(self._file.fileno(), fcntl.LOCK_UN)
-            self._file.close()
+            try:
+                _unlock_file(self._file)
+            finally:
+                self._file.close()
 
 
 def workspace_writer_lock_dir() -> Path:
     """Return the environment-independent lock namespace for this OS identity."""
+    if os.name == "nt":
+        configured = os.environ.get("LOCALAPPDATA")
+        if not configured or not Path(configured).is_absolute():
+            raise DispatchHalt("LOCALAPPDATA must be an absolute path")
+        base = _windows_validate_path(
+            Path(configured), label="LOCALAPPDATA", require_directory=True
+        )
+        return base / f"codex-tier-routing-{_windows_current_sid()}-locks"
     return Path("/tmp") / f"codex-tier-routing-{os.geteuid()}-locks"
 
 
@@ -1334,10 +2007,17 @@ class WorkspaceWriterLock:
 
     def __enter__(self) -> "WorkspaceWriterLock":
         try:
-            try:
-                self._dir.mkdir(mode=0o700)
-            except FileExistsError:
-                pass
+            if os.name == "nt":
+                try:
+                    self._dir.mkdir()
+                except FileExistsError:
+                    pass
+                _windows_secure_private(self._dir)
+            else:
+                try:
+                    self._dir.mkdir(mode=0o700)
+                except FileExistsError:
+                    pass
             private_existing_dir(self._dir, label="workspace writer lock directory")
         except DispatchHalt:
             raise
@@ -1346,7 +2026,12 @@ class WorkspaceWriterLock:
                 "unable to prepare workspace writer lock directory safely: "
                 f"{type(exc).__name__}"
             ) from exc
-        flags = os.O_RDWR | os.O_CREAT | os.O_NONBLOCK | getattr(os, "O_NOFOLLOW", 0)
+        flags = (
+            os.O_RDWR
+            | os.O_CREAT
+            | getattr(os, "O_NONBLOCK", 0)
+            | getattr(os, "O_NOFOLLOW", 0)
+        )
         try:
             descriptor = os.open(self._path, flags, 0o600)
         except OSError as exc:
@@ -1355,16 +2040,27 @@ class WorkspaceWriterLock:
             ) from exc
         try:
             details = os.fstat(descriptor)
-            if (
-                not stat.S_ISREG(details.st_mode)
-                or details.st_uid != os.geteuid()
-                or details.st_nlink != 1
-                or stat.S_IMODE(details.st_mode) & 0o077
-            ):
-                raise DispatchHalt(
-                    "workspace writer lock is not a private current-owner regular file"
+            if os.name == "nt":
+                _windows_secure_private(self._path)
+                expected = current_owner_regular(
+                    self._path, label="workspace writer lock"
                 )
-            os.fchmod(descriptor, 0o600)
+                if (
+                    details.st_dev != expected.st_dev
+                    or details.st_ino != expected.st_ino
+                ):
+                    raise DispatchHalt("workspace writer lock changed during safe open")
+            else:
+                if (
+                    not stat.S_ISREG(details.st_mode)
+                    or details.st_uid != os.geteuid()
+                    or details.st_nlink != 1
+                    or stat.S_IMODE(details.st_mode) & 0o077
+                ):
+                    raise DispatchHalt(
+                        "workspace writer lock is not a private current-owner regular file"
+                    )
+                os.fchmod(descriptor, 0o600)
         except DispatchHalt:
             os.close(descriptor)
             raise
@@ -1384,7 +2080,7 @@ class WorkspaceWriterLock:
                 f"unable to open writer lock handle safely: {type(exc).__name__}"
             ) from exc
         try:
-            fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+            _lock_file(handle, exclusive=True, nonblocking=True)
         except BlockingIOError as exc:
             handle.close()
             raise DispatchHalt(
@@ -1401,7 +2097,7 @@ class WorkspaceWriterLock:
     def __exit__(self, *_: object) -> None:
         if self._file is not None:
             try:
-                fcntl.flock(self._file.fileno(), fcntl.LOCK_UN)
+                _unlock_file(self._file)
             finally:
                 self._file.close()
 
@@ -1411,18 +2107,34 @@ def read_prompt(args: argparse.Namespace) -> str:
         path = Path(args.prompt_file).expanduser()
         descriptor = None
         try:
-            descriptor = os.open(
-                path,
-                os.O_RDONLY | os.O_NONBLOCK | getattr(os, "O_NOFOLLOW", 0),
-            )
-            details = os.fstat(descriptor)
-            if not stat.S_ISREG(details.st_mode):
-                raise DispatchHalt("prompt file must be regular")
-            if details.st_uid != os.geteuid() or details.st_mode & 0o077:
-                raise DispatchHalt("prompt file must be current-owner and owner-only")
-            flags = fcntl.fcntl(descriptor, fcntl.F_GETFL)
-            fcntl.fcntl(descriptor, fcntl.F_SETFL, flags & ~os.O_NONBLOCK)
-            raw = os.read(descriptor, MAX_PROMPT_BYTES + 1)
+            if os.name == "nt":
+                if _path_is_link(path):
+                    raise DispatchHalt("prompt file must not be a reparse point")
+                path = path.absolute()
+                expected = current_owner_regular(path, label="prompt file")
+                descriptor = os.open(path, os.O_RDONLY)
+                details = os.fstat(descriptor)
+                if (
+                    details.st_dev != expected.st_dev
+                    or details.st_ino != expected.st_ino
+                ):
+                    raise DispatchHalt("prompt file changed during safe open")
+                raw = os.read(descriptor, MAX_PROMPT_BYTES + 1)
+            else:
+                descriptor = os.open(
+                    path,
+                    os.O_RDONLY | os.O_NONBLOCK | getattr(os, "O_NOFOLLOW", 0),
+                )
+                details = os.fstat(descriptor)
+                if not stat.S_ISREG(details.st_mode):
+                    raise DispatchHalt("prompt file must be regular")
+                if details.st_uid != os.geteuid() or details.st_mode & 0o077:
+                    raise DispatchHalt(
+                        "prompt file must be current-owner and owner-only"
+                    )
+                flags = fcntl.fcntl(descriptor, fcntl.F_GETFL)
+                fcntl.fcntl(descriptor, fcntl.F_SETFL, flags & ~os.O_NONBLOCK)
+                raw = os.read(descriptor, MAX_PROMPT_BYTES + 1)
         except DispatchHalt:
             raise
         except OSError as exc:
@@ -1527,7 +2239,9 @@ def scan_rollout_candidates(
                         )
                     if time.monotonic() >= deadline:
                         raise DispatchHalt("rollout candidate scan timed out")
-                    if entry.is_symlink():
+                    if entry.is_symlink() or _stat_is_reparse(
+                        entry.stat(follow_symlinks=False)
+                    ):
                         continue
                     if depth < 3:
                         if not expected_component[depth].fullmatch(entry.name):
@@ -1562,19 +2276,26 @@ def find_rollout(home: Path, thread_id: str, earliest_mtime_ns: int) -> Path:
     sessions = home / "sessions"
     deadline = time.monotonic() + ROLLOUT_WAIT_SECONDS
     matches: list[Path] = []
-    if sessions.exists() or sessions.is_symlink():
-        try:
-            details = os.lstat(sessions)
-        except OSError as exc:
-            raise DispatchHalt("unable to inspect Codex sessions directory") from exc
-        if (
-            stat.S_ISLNK(details.st_mode)
-            or not stat.S_ISDIR(details.st_mode)
-            or details.st_uid != os.geteuid()
-            or stat.S_IMODE(details.st_mode) & 0o022
-        ):
-            raise DispatchHalt("Codex sessions directory is unsafe")
-        reject_darwin_allow_acl(sessions, label="Codex sessions directory")
+    if sessions.exists() or _path_is_link(sessions):
+        if os.name == "nt":
+            _windows_validate_path(
+                sessions, label="Codex sessions directory", require_directory=True
+            )
+        else:
+            try:
+                details = os.lstat(sessions)
+            except OSError as exc:
+                raise DispatchHalt(
+                    "unable to inspect Codex sessions directory"
+                ) from exc
+            if (
+                stat.S_ISLNK(details.st_mode)
+                or not stat.S_ISDIR(details.st_mode)
+                or details.st_uid != os.geteuid()
+                or stat.S_IMODE(details.st_mode) & 0o022
+            ):
+                raise DispatchHalt("Codex sessions directory is unsafe")
+            reject_darwin_allow_acl(sessions, label="Codex sessions directory")
     while time.monotonic() < deadline:
         if sessions.is_dir():
             matches = scan_rollout_candidates(
@@ -1592,6 +2313,25 @@ def find_rollout(home: Path, thread_id: str, earliest_mtime_ns: int) -> Path:
 
 def validate_rollout_path(home: Path, path: Path) -> None:
     """Require an owner-controlled, non-writable chain from home to rollout."""
+    if os.name == "nt":
+        home_value = os.path.normcase(os.path.realpath(home))
+        path_value = os.path.normcase(os.path.realpath(path))
+        try:
+            if os.path.commonpath((home_value, path_value)) != home_value:
+                raise DispatchHalt("rollout record is outside the Codex home")
+        except ValueError as exc:
+            raise DispatchHalt("rollout record is outside the Codex home") from exc
+        relative = Path(os.path.relpath(path_value, home_value))
+        current = home
+        for index, component in enumerate(relative.parts):
+            current /= component
+            _windows_validate_path(
+                current,
+                label="rollout provenance path",
+                require_file=index == len(relative.parts) - 1,
+                require_directory=index != len(relative.parts) - 1,
+            )
+        return
     try:
         relative = path.relative_to(home)
     except ValueError as exc:
@@ -1620,13 +2360,23 @@ def validate_rollout_path(home: Path, path: Path) -> None:
 
 def read_rollout(path: Path) -> bytes:
     try:
+        expected = current_owner_regular(path, label="rollout record")
         descriptor = os.open(path, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
         details = os.fstat(descriptor)
-        if (
-            not stat.S_ISREG(details.st_mode)
-            or details.st_uid != os.geteuid()
-            or stat.S_IMODE(details.st_mode) & 0o022
-        ):
+        unsafe = not stat.S_ISREG(details.st_mode)
+        if os.name == "nt":
+            unsafe = (
+                unsafe
+                or details.st_dev != expected.st_dev
+                or details.st_ino != expected.st_ino
+            )
+        else:
+            unsafe = (
+                unsafe
+                or details.st_uid != os.geteuid()
+                or stat.S_IMODE(details.st_mode) & 0o022
+            )
+        if unsafe:
             os.close(descriptor)
             raise DispatchHalt("rollout record is not a current-owner regular file")
         if details.st_size > MAX_ROLLOUT_BYTES:
@@ -1729,8 +2479,14 @@ def verify_observation(
     mismatches = [
         key
         for key, expected_value in expected.items()
-        if observed.get(key) != expected_value
+        if key not in {"cwd", "session_cwd"} and observed.get(key) != expected_value
     ]
+    for key in ("cwd", "session_cwd"):
+        value = observed.get(key)
+        if not isinstance(value, str) or not paths_same(Path(value), workdir):
+            mismatches.append(key)
+        else:
+            observed[key] = str(workdir)
     if mismatches:
         raise DispatchHalt(
             "host observation mismatch: " + ", ".join(sorted(mismatches))
@@ -1767,7 +2523,7 @@ def ledger_append(home: Path, receipt: dict[str, Any]) -> str:
     ledger_dir = home / "tier-routing"
     ensure_private_dir(ledger_dir)
     ledger = ledger_dir / "ledger.jsonl"
-    if ledger.is_symlink():
+    if _path_is_link(ledger):
         raise DispatchHalt("refusing symlinked local receipt ledger")
     flags = os.O_RDWR | os.O_CREAT | os.O_APPEND | getattr(os, "O_NOFOLLOW", 0)
     try:
@@ -1777,29 +2533,35 @@ def ledger_append(home: Path, receipt: dict[str, Any]) -> str:
             f"unable to open local receipt ledger safely: {type(exc).__name__}"
         ) from exc
     with os.fdopen(descriptor, "a+", encoding="utf-8") as handle:
-        os.fchmod(handle.fileno(), 0o600)
+        if os.name == "nt":
+            _windows_secure_private(ledger)
+            current_owner_regular(ledger, label="local receipt ledger")
+        else:
+            os.fchmod(handle.fileno(), 0o600)
         reject_darwin_allow_acl(ledger, label="local receipt ledger")
-        fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
-        if os.fstat(handle.fileno()).st_size > MAX_LEDGER_BYTES:
-            raise DispatchHalt("local receipt ledger exceeds the total size limit")
-        previous_hash = validate_ledger_lines(handle)
-        entry = {"previous_hash": previous_hash, "receipt": receipt}
-        entry_hash = sha256_bytes(canonical_json(entry))
-        entry["entry_hash"] = entry_hash
-        serialized = json.dumps(entry, sort_keys=True) + "\n"
-        serialized_size = len(serialized.encode("utf-8"))
-        if serialized_size > MAX_LEDGER_ENTRY_BYTES:
-            raise DispatchHalt("local receipt ledger entry exceeds the size limit")
-        if os.fstat(handle.fileno()).st_size + serialized_size > MAX_LEDGER_BYTES:
-            raise DispatchHalt(
-                "local receipt ledger would exceed the total size limit; "
-                "checkpoint and rotate it before dispatching again"
-            )
-        handle.seek(0, os.SEEK_END)
-        handle.write(serialized)
-        handle.flush()
-        os.fsync(handle.fileno())
-        fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+        _lock_file(handle, exclusive=True)
+        try:
+            if os.fstat(handle.fileno()).st_size > MAX_LEDGER_BYTES:
+                raise DispatchHalt("local receipt ledger exceeds the total size limit")
+            previous_hash = validate_ledger_lines(handle)
+            entry = {"previous_hash": previous_hash, "receipt": receipt}
+            entry_hash = sha256_bytes(canonical_json(entry))
+            entry["entry_hash"] = entry_hash
+            serialized = json.dumps(entry, sort_keys=True) + "\n"
+            serialized_size = len(serialized.encode("utf-8"))
+            if serialized_size > MAX_LEDGER_ENTRY_BYTES:
+                raise DispatchHalt("local receipt ledger entry exceeds the size limit")
+            if os.fstat(handle.fileno()).st_size + serialized_size > MAX_LEDGER_BYTES:
+                raise DispatchHalt(
+                    "local receipt ledger would exceed the total size limit; "
+                    "checkpoint and rotate it before dispatching again"
+                )
+            handle.seek(0, os.SEEK_END)
+            handle.write(serialized)
+            handle.flush()
+            os.fsync(handle.fileno())
+        finally:
+            _unlock_file(handle)
     return f"local-ledger://{entry_hash}"
 
 
@@ -1940,12 +2702,77 @@ def verify_policy_binding(receipt: dict[str, Any]) -> None:
                 raise DispatchHalt(f"receipt policy observation mismatch: {key}")
 
 
+def _assign_windows_job(process: subprocess.Popen[bytes]) -> None:
+    job = _KERNEL32.CreateJobObjectW(None, None)
+    if not job:
+        process.kill()
+        raise DispatchHalt("unable to create a Windows process job")
+    limits = _JobExtendedLimits()
+    limits.basic.limit_flags = 0x00002000
+    if not _KERNEL32.SetInformationJobObject(
+        job, 9, ctypes.byref(limits), ctypes.sizeof(limits)
+    ) or not _KERNEL32.AssignProcessToJobObject(job, wintypes.HANDLE(process._handle)):
+        error = ctypes.get_last_error()
+        process.kill()
+        _KERNEL32.CloseHandle(job)
+        raise DispatchHalt(
+            f"unable to contain the Windows process tree: {_windows_error('job', error)}"
+        )
+    process._codex_tier_job = job  # type: ignore[attr-defined]
+
+
+def _resume_windows_process(process: subprocess.Popen[bytes]) -> None:
+    snapshot = _KERNEL32.CreateToolhelp32Snapshot(0x00000004, 0)
+    if snapshot == ctypes.c_void_p(-1).value:
+        raise _windows_error("unable to inspect the suspended Windows process")
+    try:
+        entry = _ThreadEntry32()
+        entry.size = ctypes.sizeof(entry)
+        found = _KERNEL32.Thread32First(snapshot, ctypes.byref(entry))
+        while found:
+            if entry.owner_process_id == process.pid:
+                thread = _KERNEL32.OpenThread(0x0002, False, entry.thread_id)
+                if not thread:
+                    raise _windows_error("unable to open the suspended Windows thread")
+                try:
+                    if _KERNEL32.ResumeThread(thread) == 0xFFFFFFFF:
+                        raise _windows_error(
+                            "unable to resume the contained Windows process"
+                        )
+                    return
+                finally:
+                    _KERNEL32.CloseHandle(thread)
+            found = _KERNEL32.Thread32Next(snapshot, ctypes.byref(entry))
+        raise DispatchHalt("unable to find the suspended Windows process thread")
+    finally:
+        _KERNEL32.CloseHandle(snapshot)
+
+
+def _close_windows_job(
+    process: subprocess.Popen[bytes], *, terminate: bool = False
+) -> None:
+    job = getattr(process, "_codex_tier_job", None)
+    if not job:
+        return
+    if terminate:
+        _KERNEL32.TerminateJobObject(job, 1)
+    _KERNEL32.CloseHandle(job)
+    process._codex_tier_job = None  # type: ignore[attr-defined]
+
+
 def reap_process_group(process: subprocess.Popen[bytes]) -> None:
     """Tear down a child group without swallowing a second control-flow exit."""
-    try:
-        os.killpg(process.pid, signal.SIGKILL)
-    except OSError:
-        pass
+    if os.name == "nt":
+        _close_windows_job(process, terminate=True)
+        try:
+            process.kill()
+        except OSError:
+            pass
+    else:
+        try:
+            os.killpg(process.pid, signal.SIGKILL)
+        except OSError:
+            pass
     for stream in (process.stdin, process.stdout, process.stderr):
         if stream is not None:
             try:
@@ -1956,6 +2783,85 @@ def reap_process_group(process: subprocess.Popen[bytes]) -> None:
         process.wait(timeout=5)
     except (OSError, subprocess.TimeoutExpired):
         pass
+
+
+def _run_windows_process_bounded(
+    command: list[str],
+    *,
+    task_input: Any,
+    cwd: Path | None,
+    env: dict[str, str],
+    timeout: int,
+    stdout_limit: int,
+    stderr_limit: int,
+    operation: str,
+    suffix: str,
+) -> tuple[subprocess.Popen[bytes], int, bytes, bytes]:
+    process = subprocess.Popen(
+        command,
+        cwd=cwd,
+        stdin=task_input,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        env=env,
+        creationflags=(subprocess.CREATE_NEW_PROCESS_GROUP | _WINDOWS_CREATE_SUSPENDED),
+    )
+    try:
+        _assign_windows_job(process)
+        _resume_windows_process(process)
+    except BaseException:
+        reap_process_group(process)
+        raise
+    if process.stdout is None or process.stderr is None:
+        reap_process_group(process)
+        raise DispatchHalt(f"{operation} did not expose bounded streams")
+
+    buffers = {"stdout": bytearray(), "stderr": bytearray()}
+    limits = {"stdout": stdout_limit, "stderr": stderr_limit}
+    overflow: list[str] = []
+    overflow_event = threading.Event()
+
+    def read_stream(name: str, stream: Any) -> None:
+        while True:
+            chunk = stream.read(64 * 1024)
+            if not chunk:
+                return
+            buffers[name].extend(chunk)
+            if len(buffers[name]) > limits[name]:
+                overflow.append(name)
+                overflow_event.set()
+                return
+
+    readers = [
+        threading.Thread(target=read_stream, args=(name, stream), daemon=True)
+        for name, stream in (("stdout", process.stdout), ("stderr", process.stderr))
+    ]
+    for reader in readers:
+        reader.start()
+    deadline = time.monotonic() + timeout
+    while process.poll() is None:
+        if overflow_event.wait(0.01):
+            name = overflow[0]
+            reap_process_group(process)
+            raise DispatchHalt(
+                f"{operation} {name} exceeded {limits[name]} bytes{suffix}"
+            )
+        if time.monotonic() >= deadline:
+            reap_process_group(process)
+            raise DispatchHalt(f"{operation} timed out{suffix}")
+    returncode = process.wait()
+    _close_windows_job(process)
+    for reader in readers:
+        reader.join(timeout=5)
+    if any(reader.is_alive() for reader in readers):
+        reap_process_group(process)
+        raise DispatchHalt(f"{operation} stream cleanup failed{suffix}")
+    process.stdout.close()
+    process.stderr.close()
+    if overflow:
+        name = overflow[0]
+        raise DispatchHalt(f"{operation} {name} exceeded {limits[name]} bytes{suffix}")
+    return process, returncode, bytes(buffers["stdout"]), bytes(buffers["stderr"])
 
 
 def run_process_bounded(
@@ -1970,73 +2876,95 @@ def run_process_bounded(
     operation: str = "Codex control command",
     ambiguous_on_failure: bool = False,
 ) -> subprocess.CompletedProcess[str]:
-    """Run one Unix process while bounding both captured streams in memory."""
+    """Run one process while bounding both captured streams in memory."""
     process: subprocess.Popen[bytes] | None = None
     suffix = "; completion state is ambiguous" if ambiguous_on_failure else ""
     try:
-        with tempfile.TemporaryFile(mode="w+b", dir="/tmp") as task_input:
+        with tempfile.TemporaryFile(
+            mode="w+b", dir=None if os.name == "nt" else "/tmp"
+        ) as task_input:
             task_input.write(input_bytes)
             task_input.seek(0)
-            process = subprocess.Popen(
-                command,
-                cwd=cwd,
-                stdin=task_input,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                env=env,
-                start_new_session=True,
-            )
-            if process.stdout is None or process.stderr is None:
-                raise DispatchHalt(f"{operation} did not expose bounded streams")
+            if os.name == "nt":
+                process, returncode, stdout_bytes, stderr_bytes = (
+                    _run_windows_process_bounded(
+                        command,
+                        task_input=task_input,
+                        cwd=cwd,
+                        env=env,
+                        timeout=timeout,
+                        stdout_limit=stdout_limit,
+                        stderr_limit=stderr_limit,
+                        operation=operation,
+                        suffix=suffix,
+                    )
+                )
+            else:
+                process = subprocess.Popen(
+                    command,
+                    cwd=cwd,
+                    stdin=task_input,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    env=env,
+                    start_new_session=True,
+                )
+                if process.stdout is None or process.stderr is None:
+                    raise DispatchHalt(f"{operation} did not expose bounded streams")
 
-            buffers = {"stdout": bytearray(), "stderr": bytearray()}
-            limits = {"stdout": stdout_limit, "stderr": stderr_limit}
-            selector = selectors.DefaultSelector()
-            try:
-                for name, stream in (
-                    ("stdout", process.stdout),
-                    ("stderr", process.stderr),
-                ):
-                    os.set_blocking(stream.fileno(), False)
-                    selector.register(stream, selectors.EVENT_READ, name)
-                deadline = time.monotonic() + timeout
-                while selector.get_map():
+                buffers = {"stdout": bytearray(), "stderr": bytearray()}
+                limits = {"stdout": stdout_limit, "stderr": stderr_limit}
+                selector = selectors.DefaultSelector()
+                try:
+                    for name, stream in (
+                        ("stdout", process.stdout),
+                        ("stderr", process.stderr),
+                    ):
+                        os.set_blocking(stream.fileno(), False)
+                        selector.register(stream, selectors.EVENT_READ, name)
+                    deadline = time.monotonic() + timeout
+                    while selector.get_map():
+                        remaining = deadline - time.monotonic()
+                        if remaining <= 0:
+                            reap_process_group(process)
+                            raise DispatchHalt(f"{operation} timed out{suffix}")
+                        events = selector.select(min(remaining, 0.25))
+                        for key, _ in events:
+                            name = key.data
+                            try:
+                                chunk = os.read(key.fileobj.fileno(), 64 * 1024)
+                            except BlockingIOError:
+                                continue
+                            if not chunk:
+                                selector.unregister(key.fileobj)
+                                key.fileobj.close()
+                                continue
+                            buffers[name].extend(chunk)
+                            if len(buffers[name]) > limits[name]:
+                                reap_process_group(process)
+                                raise DispatchHalt(
+                                    f"{operation} {name} exceeded "
+                                    f"{limits[name]} bytes{suffix}"
+                                )
                     remaining = deadline - time.monotonic()
                     if remaining <= 0:
                         reap_process_group(process)
                         raise DispatchHalt(f"{operation} timed out{suffix}")
-                    events = selector.select(min(remaining, 0.25))
-                    for key, _ in events:
-                        name = key.data
-                        try:
-                            chunk = os.read(key.fileobj.fileno(), 64 * 1024)
-                        except BlockingIOError:
-                            continue
-                        if not chunk:
-                            selector.unregister(key.fileobj)
-                            key.fileobj.close()
-                            continue
-                        buffers[name].extend(chunk)
-                        if len(buffers[name]) > limits[name]:
-                            reap_process_group(process)
-                            raise DispatchHalt(
-                                f"{operation} {name} exceeded {limits[name]} bytes{suffix}"
-                            )
-                remaining = deadline - time.monotonic()
-                if remaining <= 0:
-                    reap_process_group(process)
-                    raise DispatchHalt(f"{operation} timed out{suffix}")
-                try:
-                    returncode = process.wait(timeout=remaining)
-                except subprocess.TimeoutExpired as exc:
-                    reap_process_group(process)
-                    raise DispatchHalt(f"{operation} timed out{suffix}") from exc
-            finally:
-                selector.close()
+                    try:
+                        returncode = process.wait(timeout=remaining)
+                    except subprocess.TimeoutExpired as exc:
+                        reap_process_group(process)
+                        raise DispatchHalt(f"{operation} timed out{suffix}") from exc
+                finally:
+                    selector.close()
+                stdout_bytes = bytes(buffers["stdout"])
+                stderr_bytes = bytes(buffers["stderr"])
         try:
-            stdout = bytes(buffers["stdout"]).decode("utf-8")
-            stderr = bytes(buffers["stderr"]).decode("utf-8")
+            stdout = stdout_bytes.decode("utf-8")
+            stderr = stderr_bytes.decode("utf-8")
         except UnicodeError as exc:
+            if process is not None:
+                reap_process_group(process)
             raise DispatchHalt(f"{operation} emitted non-UTF-8 output{suffix}") from exc
     except DispatchHalt:
         if process is not None:
@@ -2098,7 +3026,11 @@ def git_preflight_output(
         ],
         input_bytes=input_bytes,
         cwd=workdir,
-        env=child_environment(home),
+        env={
+            **child_environment(home),
+            "GIT_NO_LAZY_FETCH": "1",
+            "GIT_TERMINAL_PROMPT": "0",
+        },
         timeout=10,
         stdout_limit=stdout_limit,
         stderr_limit=MAX_CONTROL_STDERR_BYTES,
@@ -2160,6 +3092,8 @@ def reject_active_git_filters(executable: Path, workdir: Path, home: Path) -> No
 
 
 def surgeon_workspace_precondition(workdir: Path, home: Path) -> dict[str, str]:
+    if os.name == "nt":
+        _windows_validate_path(workdir, label="surgeon workdir", require_directory=True)
     executable = resolve_git()
 
     root_raw = git_preflight_output(
@@ -2176,7 +3110,7 @@ def surgeon_workspace_precondition(workdir: Path, home: Path) -> dict[str, str]:
         root = Path(root_raw).resolve(strict=True)
     except OSError as exc:
         raise DispatchHalt("surgeon workdir must be a Git worktree root") from exc
-    if root != workdir:
+    if not paths_same(root, workdir):
         raise DispatchHalt("surgeon workdir must be a Git worktree root")
 
     git_paths = []
@@ -2200,7 +3134,12 @@ def surgeon_workspace_precondition(workdir: Path, home: Path) -> dict[str, str]:
             )
         except OSError as exc:
             raise DispatchHalt("surgeon workdir must be a linked Git worktree") from exc
-    if git_paths[0] == git_paths[1]:
+    if os.name == "nt":
+        for git_path in git_paths:
+            _windows_validate_path(
+                git_path, label="surgeon Git metadata", require_directory=True
+            )
+    if paths_same(git_paths[0], git_paths[1]):
         raise DispatchHalt("surgeon workdir must be a linked Git worktree")
 
     starting_head = git_preflight_output(
@@ -2253,11 +3192,11 @@ def dispatch(args: argparse.Namespace, home: Path | None = None) -> int:
     is_surgeon = args.route == "surgeon"
     receipt_policy = surgeon_policy(active_policy) if is_surgeon else active_policy
     route = SURGEON_ROUTE if is_surgeon else active_policy.routes[args.route]
-    workdir = Path(args.workdir).expanduser().resolve()
+    workdir = resolve_workdir(args.workdir)
     if not workdir.is_dir():
         raise DispatchHalt("workdir must be an existing directory")
     prompt = read_prompt(args)
-    if home == workdir or home.is_relative_to(workdir) or workdir.is_relative_to(home):
+    if paths_overlap(home, workdir):
         raise DispatchHalt("workdir and Codex home must not contain one another")
     launch = resolve_codex()
     if native_multi_agent_enabled(launch, home, cwd=workdir):
@@ -2271,6 +3210,11 @@ def dispatch(args: argparse.Namespace, home: Path | None = None) -> int:
     preflight_ledger(home)
     receipt = base_receipt(args.route, route, receipt_policy, workdir, launch)
     verify_policy_binding(receipt)
+    windows_sandbox = (
+        ["-c", f'windows.sandbox="{windows_sandbox_mode(home)}"']
+        if os.name == "nt" and route.sandbox == "workspace-write"
+        else []
+    )
     output = ""
     try:
         writer_lock = (
@@ -2304,6 +3248,7 @@ def dispatch(args: argparse.Namespace, home: Path | None = None) -> int:
                 "sandbox_workspace_write.network_access=false",
                 "-c",
                 "sandbox_workspace_write.writable_roots=[]",
+                *windows_sandbox,
                 "-s",
                 route.sandbox,
                 "-C",
@@ -2486,9 +3431,13 @@ def read_receipt_check_input(args: argparse.Namespace) -> bytes:
         path = Path(args.receipt_file).expanduser()
         if not path.is_absolute():
             raise DispatchHalt("receipt file path must be absolute")
+        if _path_is_link(path):
+            raise DispatchHalt(
+                "receipt input path must not be a symlink or reparse point"
+            )
         path = validate_executable_chain(path, label="receipt input path")
         details = current_owner_regular(path, label="receipt input")
-        if stat.S_IMODE(details.st_mode) & 0o077:
+        if os.name != "nt" and stat.S_IMODE(details.st_mode) & 0o077:
             raise DispatchHalt(
                 "receipt input must not grant group/other permissions (use mode 0600)"
             )
@@ -2500,11 +3449,16 @@ def read_receipt_check_input(args: argparse.Namespace) -> bytes:
             opened = os.fstat(descriptor)
             if (
                 not stat.S_ISREG(opened.st_mode)
-                or opened.st_uid != os.geteuid()
                 or opened.st_dev != details.st_dev
                 or opened.st_ino != details.st_ino
-                or stat.S_IMODE(opened.st_mode) & 0o077
                 or opened.st_size > MAX_RECEIPT_CHECK_BYTES
+                or (
+                    os.name != "nt"
+                    and (
+                        opened.st_uid != os.geteuid()
+                        or stat.S_IMODE(opened.st_mode) & 0o077
+                    )
+                )
             ):
                 os.close(descriptor)
                 raise DispatchHalt("receipt input changed or became unsafe")

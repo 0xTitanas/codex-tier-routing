@@ -148,6 +148,13 @@ notes: |
                     encoding="utf-8",
                 )
                 self.assertEqual(check(root), 1)
+                workflow = (
+                    (ROOT / ".github" / "workflows" / "ci.yml")
+                    .read_bytes()
+                    .replace(b"\r\n", b"\n")
+                )
+                path.write_bytes(workflow.replace(b"\n", b"\r\n"))
+                self.assertEqual(check(root), 0)
 
     def test_release_metadata_rejects_commented_runtime_assignment(self) -> None:
         check = VALIDATE["check_release_metadata"]

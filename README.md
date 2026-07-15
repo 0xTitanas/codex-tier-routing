@@ -6,7 +6,7 @@
 
 [![License: MIT](https://img.shields.io/badge/license-MIT-2ea44f.svg)](LICENSE)
 [![Release: v1.1.0-rc.1](https://img.shields.io/badge/release-v1.1.0--rc.1-f0ad4e.svg)](CHANGELOG.md)
-[![Platforms: macOS + Linux](https://img.shields.io/badge/platforms-macOS%20%2B%20Linux-4c78ff.svg)](docs/compatibility.md)
+[![Platforms: macOS + Linux + Windows](https://img.shields.io/badge/platforms-macOS%20%2B%20Linux%20%2B%20Windows-4c78ff.svg)](docs/compatibility.md)
 
 </div>
 
@@ -90,8 +90,10 @@ parent may also remain single-agent when delegation is unnecessary.
   `codex exec`
 - A working Codex login for that CLI
 - Access to the configured model names
-- macOS or x86-64 Ubuntu 22.04, 24.04, or 26.04 LTS; Windows is not currently
-  supported
+- macOS, x86-64 Ubuntu 22.04, 24.04, or 26.04 LTS, or native Windows 11. With
+  Codex CLI 0.144.4, run Windows dispatches from an interactive console or RDP
+  session; OpenSSH/Session 0 is outside the supported boundary (see
+  [compatibility](docs/compatibility.md)).
 
 See [compatibility](docs/compatibility.md) for the tested boundary.
 
@@ -129,8 +131,23 @@ If both commands pass, install into `${CODEX_HOME:-$HOME/.codex}`:
 ./install.sh --strict
 ```
 
-Keep the exact uninstall command printed at the end. Restart every Codex surface
-using that home, open a new session, and verify the installation:
+On Windows, use PowerShell from the repository root:
+
+```powershell
+python scripts\validate.py
+.\install.ps1 -Strict -DryRun
+.\install.ps1 -Strict
+& "$env:USERPROFILE\.codex\bin\codex-tier.cmd" probe
+```
+
+The native installer uses owner-only ACLs, transactional rollback, and
+timestamped collision backups. It adds the install `bin` directory to the user
+`PATH`; open a fresh interactive console or RDP session before invoking
+`codex-tier` by name.
+
+On macOS and Linux, keep the exact uninstall command printed at the end.
+Restart every Codex surface using that home, open a new session, and verify the
+installation:
 
 ```sh
 "${CODEX_HOME:-$HOME/.codex}/bin/codex-tier" probe
@@ -174,15 +191,20 @@ The strict installer copies:
 - `skills/model-routing/` to `$CODEX_HOME/skills/model-routing/`
 - `bin/codex-tier` and `bin/codex-tier.py` to `$CODEX_HOME/bin/`
 
+On Windows, `install.ps1` copies the same six profiles and skill plus
+`codex-tier.cmd`, `codex-tier-launcher.ps1`, and `codex-tier.py` to the
+corresponding `%CODEX_HOME%` directories.
+
 When native generic subagent spawning is not already disabled, it also updates
 `$CODEX_HOME/config.toml` and retains the previous bytes for a guarded restore.
 If that setting was already disabled outside this project, the installer leaves
 it unmanaged and does not create a configuration backup.
 
-If `CODEX_HOME` is unset, the installer uses `$HOME/.codex`. Existing files are
-moved into an owner-only timestamped backup tree before replacement. The
-installer prints an exact uninstall command for the files and strict
-configuration it manages.
+If `CODEX_HOME` is unset, the POSIX installer uses `$HOME/.codex` and the
+Windows installer uses `%USERPROFILE%\.codex`. Existing files are moved into an
+owner-only timestamped backup tree before replacement. The POSIX installer
+prints an exact uninstall command for the files and strict configuration it
+manages; the Windows installer does not generate an uninstall command.
 
 ## Test in an isolated Codex home
 
@@ -253,21 +275,25 @@ sections, including host-added project trust metadata. It HALTs without
 overwriting the file if that managed setting changed or the edit is otherwise
 ambiguous.
 
-To uninstall, run the exact uninstall command printed by the successful
+On macOS and Linux, run the exact uninstall command printed by the successful
 installer. It restores any strict configuration managed by that installation
-before removing the installed profiles, skill, and dispatcher. Backup trees,
-custom policy, and the local receipt ledger are retained for manual inspection
-or removal. If native spawning was already disabled before installation,
-disable and uninstall leave that setting unchanged.
+before removing the installed profiles, skill, and dispatcher. On Windows, run
+`strict-disable`, then inspect and remove only the installed files and matching
+user `PATH` entry manually; `install.ps1` does not automate uninstall. Backup
+trees, custom policy, and the local receipt ledger are retained for manual
+inspection or removal. If native spawning was already disabled before
+installation, disable and uninstall leave that setting unchanged.
 
-Writer-lock files under `/tmp/codex-tier-routing-<uid>-locks` are also retained
-to avoid split-inode races. Remove that owner-only directory only when no routed
+Writer-lock files under `/tmp/codex-tier-routing-<uid>-locks` on POSIX and
+`%LOCALAPPDATA%\codex-tier-routing-<SID>-locks` on Windows are also retained to
+avoid split-inode races. Remove that owner-only directory only when no routed
 dispatch can still be running as that operating-system identity.
 
 ## Commands
 
-The installer does not modify `PATH`. In the summary below, `codex-tier` means
-`${CODEX_HOME:-$HOME/.codex}/bin/codex-tier`.
+The POSIX installer does not modify `PATH`; there, `codex-tier` below means
+`${CODEX_HOME:-$HOME/.codex}/bin/codex-tier`. The Windows installer adds its
+`bin` directory to the user `PATH`, effective in a new shell.
 
 ```text
 codex-tier --version
@@ -303,8 +329,9 @@ Treat every `HALT` as a failed setup or dispatch; do not continue past it.
 - If the canary reports an unavailable model or effort, confirm account access
   or update the owner-only policy, run `policy-check`, and retry one bounded
   canary. The dispatcher does not silently fall back to another model.
-- If `codex-tier` is not found, invoke it through the full path shown throughout
-  this README; installation does not add its directory to `PATH`.
+- If `codex-tier` is not found on macOS or Linux, invoke it through the full
+  path shown throughout this README. On Windows, open a new shell after install
+  or invoke `%CODEX_HOME%\bin\codex-tier.cmd` directly.
 
 ## Security boundary
 
@@ -312,12 +339,14 @@ The installer and dispatcher:
 
 - reject symlinked, cross-owner, and unsafe writable Codex-home paths;
 - resolve the Codex executable from an absolute, owner-checked path;
-- run installer filesystem utilities through the platform's system utility path;
+- run POSIX installer filesystem utilities through the platform's system utility
+  path and use native PowerShell/.NET filesystem APIs on Windows;
 - validate lexical and resolved Python interpreter paths before strict installation;
 - start strict-mode Python processes with a minimal environment;
-- launch the installed dispatcher through a hardened `/bin/sh` wrapper that
-  clears loader and Python startup variables before resolving the interpreter;
-- invoke script-based Codex entrypoints through an independently validated
+- launch the installed dispatcher through a hardened `/bin/sh` wrapper on
+  POSIX or a profile-free PowerShell launcher on Windows; both clear Python
+  startup variables before resolving the interpreter;
+- invoke script-based POSIX Codex entrypoints through an independently validated
   shebang runtime instead of allowing the kernel to resolve it again;
 - bind launcher, dispatcher source, Python interpreter, Codex entrypoint, and
   Codex runtime paths and hashes into each receipt;
@@ -331,17 +360,18 @@ The installer and dispatcher:
   verified omission to an explicit `writable_roots: []`;
 - launch each child with approval policy `never` and verify the observed
   value afterward;
-- prevent concurrent write-capable routes from targeting the same
-  device/inode-identified workdir across Codex homes used by the same operating-
-  system identity;
-- kill the child process group on timeout or stream failure;
+- prevent concurrent write-capable routes from targeting the same resolved
+  workdir identity across Codex homes used by the same operating-system
+  identity;
+- kill the POSIX child process group or contained Windows Job Object on timeout
+  or stream failure;
 - record a halt instead of accepting missing or mismatched observations.
 
 The Codex process receives an explicit environment containing the validated
-home boundaries plus `PATH` and locale/terminal values. Arbitrary caller
-variables and environment-only API credentials are not forwarded. This is
-still not a credential-isolation boundary: Codex can use its normal saved login
-state, and its session files contain task and output data.
+home boundaries plus a narrow platform allowlist including `PATH`.
+Environment-only API credentials and arbitrary caller variables are not
+forwarded. This is still not a credential-isolation boundary: Codex can use its
+normal saved login state, and its session files contain task and output data.
 
 The `read-only` and `workspace-write` labels describe the host-observed local
 shell/filesystem sandbox. They do not attest provider behavior or make every
@@ -359,7 +389,10 @@ Read [SECURITY.md](SECURITY.md) and the
 - macOS and x86-64 Ubuntu 22.04, 24.04, and 26.04 LTS are tested and supported
   today. Other Linux distributions and architectures are outside the
   release-gated compatibility boundary.
-- Windows is not currently supported.
+- Native Windows 11 is tested and supported.
+- On Windows, run dispatches from an interactive console or RDP session. Codex
+  CLI 0.144.4 sandboxed tool processes exit before command execution under
+  OpenSSH/Session 0, so that host mode is outside the supported boundary.
 
 ## Limits
 
@@ -375,8 +408,9 @@ Read [SECURITY.md](SECURITY.md) and the
   attestation claim is made.
 - Model-name syntax validation is not account-access validation. Use a bounded
   canary to test each configured mapping.
-- The trust model excludes root, the current operating-system identity, and any
-  identity able to write a trusted runtime ancestor. See the
+- The trust model excludes root, trusted Windows system-owner identities, the
+  current operating-system identity, and any identity able to write a trusted
+  runtime ancestor. See the
   [threat model](docs/threat-model.md).
 
 ## Development
@@ -392,7 +426,9 @@ python -m unittest discover -s tests -v
 sh -n install.sh
 sh -n bin/codex-tier
 PYTHONPYCACHEPREFIX=/tmp/codex-tier-pycache python -m py_compile \
-  bin/codex-tier.py scripts/validate.py tests/test_codex_tier.py tests/test_installer.py
+  bin/codex-tier.py scripts/validate.py tests/test_codex_tier.py \
+  tests/test_installer.py tests/test_validate.py tests/test_windows.py \
+  tests/test_windows_installer.py
 ruff check .
 ruff format --check scripts tests bin/codex-tier.py
 ```
@@ -401,6 +437,8 @@ ruff format --check scripts tests bin/codex-tier.py
 
 - [`agents/`](agents/): six Codex agent profiles
 - [`bin/codex-tier`](bin/codex-tier): hardened POSIX launcher
+- [`bin/codex-tier.cmd`](bin/codex-tier.cmd): native Windows command shim
+- [`bin/codex-tier-launcher.ps1`](bin/codex-tier-launcher.ps1): hardened PowerShell launcher
 - [`bin/codex-tier.py`](bin/codex-tier.py): local dispatcher runtime
 - [`skills/model-routing/SKILL.md`](skills/model-routing/SKILL.md): routing policy
 - [`schemas/local-dispatch-receipt.schema.json`](schemas/local-dispatch-receipt.schema.json): receipt contract
@@ -413,6 +451,7 @@ ruff format --check scripts tests bin/codex-tier.py
 - [`policy.sample.toml`](policy.sample.toml): optional single-file model/effort customization
 - [`VERSION`](VERSION): canonical project version
 - [`install.sh`](install.sh): transactional installer
+- [`install.ps1`](install.ps1): native transactional Windows installer
 - [`docs/releasing.md`](docs/releasing.md): clean-CI, tagging, and prerelease procedure
 - [`scripts/validate.py`](scripts/validate.py): repository validator
 - [`tests/`](tests/): dispatcher and installer regression suite

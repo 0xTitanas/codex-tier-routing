@@ -6,7 +6,6 @@ from __future__ import annotations
 # Copyright: 2026 0xTitanas
 # SPDX-License-Identifier: MIT
 
-import fcntl
 import hashlib
 import importlib.machinery
 import importlib.util
@@ -26,6 +25,11 @@ import unittest
 import uuid
 from pathlib import Path
 from unittest import mock
+
+if os.name != "nt":
+    import fcntl
+else:
+    fcntl = None
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -482,6 +486,7 @@ class RepositoryValidatorTests(unittest.TestCase):
             self.assertEqual(CODEX_TIER_VALIDATE.check_public_privacy(root), 1)
 
 
+@unittest.skipIf(os.name == "nt", "POSIX launcher regression")
 class DispatcherTests(unittest.TestCase):
     def setUp(self) -> None:
         self.addCleanup(os.umask, os.umask(0o077))

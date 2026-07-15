@@ -10,9 +10,9 @@ A clean CI result has all of these properties:
 
 - every intended source change is committed and pushed;
 - GitHub checks out that commit into a fresh hosted runner;
-- the `Lint and format` job and all thirteen test-matrix jobs pass:
-  Ubuntu 22.04 and 24.04 plus `macos-latest` on Python 3.11-3.14, and
-  Ubuntu 26.04 on its verified system Python 3.14;
+- the `Lint and format` job and the complete test matrix pass: Ubuntu 22.04 and
+  24.04, `macos-latest`, and `windows-latest` on Python 3.11-3.14, plus Ubuntu
+  26.04 on its verified system Python 3.14;
 - repository validation, schema locks, shell syntax, compilation, installer
   dry-run, and checkout-cleanliness checks pass; and
 - the release tag names the same commit and passes its own tag-triggered run.
@@ -38,6 +38,11 @@ Review every listed change. Commit the complete candidate on a non-`main`
 branch using the repository's normal signing policy. Do not include local
 receipts, Codex sessions, credentials, caches, or test artifacts.
 
+Run the native Windows checks from [CONTRIBUTING.md](../CONTRIBUTING.md) in an
+interactive console or RDP session, including a fresh install and bounded live
+canaries for all six routes when authentication is available. OpenSSH/Session 0
+does not satisfy this release gate for Codex CLI 0.144.4.
+
 If the tag will be published on a date other than `2026-07-14`, update the
 dated heading in `CHANGELOG.md` and `date-released` in `CITATION.cff` before
 committing. `scripts/validate.py` requires those values to agree.
@@ -56,13 +61,13 @@ gh pr create --fill --base main --head "$BRANCH"
 gh pr checks --watch
 ```
 
-Require these fourteen checks: `Lint and format`; each of
-`ubuntu-22.04`, `ubuntu-24.04`, and `macos-latest` on Python 3.11, 3.12,
-3.13, and 3.14; and `ubuntu-26.04 / Python 3.14`. The Ubuntu 26.04 job uses
-the runner's system interpreter and first verifies that its Python minor is
-3.14. The workflow runs on pull requests, pushes to `main`, `v*` tags, and
-manual dispatch. If a job fails, fix it in a new commit and let GitHub rerun
-the complete workflow. Do not merge using a local-only pass.
+Require every check emitted by the reviewed workflow: `Lint and format`; each
+of `ubuntu-22.04`, `ubuntu-24.04`, `macos-latest`, and `windows-latest` on
+Python 3.11, 3.12, 3.13, and 3.14; and `ubuntu-26.04 / Python 3.14`. The Ubuntu
+26.04 job uses the runner's system interpreter and first verifies that its
+Python minor is 3.14. The workflow runs on pull requests, pushes to `main`,
+`v*` tags, and manual dispatch. If a job fails, fix it in a new commit and let
+GitHub rerun the complete workflow. Do not merge using a local-only pass.
 
 For the canonical repository, configure a `main` ruleset that requires pull
 requests, requires these CI checks, requires the branch to be current before
@@ -111,10 +116,10 @@ instructions from the public release page.
 
 ## 5. After publication
 
-Exercise one fresh macOS installation and one fresh Linux installation from the
-tagged source archive. Record the operating system, Python version, Codex CLI
-version, and whether the check was deterministic-only or included an authorized
-bounded live canary.
+Exercise one fresh macOS installation, one fresh Linux installation, and one
+fresh native Windows installation from the tagged source archive. Record the
+operating system, Python version, Codex CLI version, and whether the check was
+deterministic-only or included an authorized bounded live canary.
 
 Do not move or reuse a published tag. If a release-blocking defect appears,
 document it, fix it on a new branch, and publish `v1.1.0-rc.2` after the same

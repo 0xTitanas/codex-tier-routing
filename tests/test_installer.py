@@ -20,6 +20,7 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 
 
+@unittest.skipIf(os.name == "nt", "POSIX installer regression")
 class InstallerTests(unittest.TestCase):
     def setUp(self) -> None:
         self.addCleanup(os.umask, os.umask(0o077))

@@ -45,7 +45,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-22.04, ubuntu-24.04, macos-latest]
+        os: [ubuntu-22.04, ubuntu-24.04, macos-latest, windows-latest]
         python: ['3.11', '3.12', '3.13', '3.14']
         system_python: [false]
         include:
@@ -68,34 +68,72 @@ jobs:
         if: ${{ matrix.system_python }}
         run: test "$(python3 -c 'import sys; print(f\"{sys.version_info.major}.{sys.version_info.minor}\")')" = "${{ matrix.python }}"
       - name: Prepare safe interpreter for trust validation
+        if: runner.os != 'Windows'
         run: |
           SAFE_VENV="$RUNNER_TEMP/safe-python"
           python3 -m venv --copies "$SAFE_VENV"
           echo "$SAFE_VENV/bin" >> "$GITHUB_PATH"
-      - name: Validate repository
+      - name: Validate repository (POSIX)
+        if: runner.os != 'Windows'
         run: python3 scripts/validate.py
-      - name: Run unit tests
+      - name: Validate repository (Windows)
+        if: runner.os == 'Windows'
+        run: python scripts/validate.py
+      - name: Run unit tests (POSIX)
+        if: runner.os != 'Windows'
         run: |
           umask 0002
           python3 -m unittest discover -s tests -v
-      - name: Check shell syntax
+      - name: Run native Windows unit tests
+        if: runner.os == 'Windows'
+        run: python -m unittest discover -s tests -v
+      - name: Check POSIX shell syntax
+        if: runner.os != 'Windows'
         run: |
           sh -n install.sh
           sh -n bin/codex-tier
-      - name: Compile Python sources
+      - name: Compile Python sources (POSIX)
+        if: runner.os != 'Windows'
         run: |
           PYTHONPYCACHEPREFIX="$RUNNER_TEMP/codex-tier-pycache" python3 -m py_compile \
-            bin/codex-tier.py \
-            scripts/validate.py \
-            tests/test_codex_tier.py \
-            tests/test_installer.py
-      - name: Exercise strict installer dry-run
+            bin/codex-tier.py scripts/validate.py tests/test_codex_tier.py \
+            tests/test_installer.py tests/test_validate.py tests/test_windows.py \
+            tests/test_windows_installer.py
+      - name: Compile Python sources (Windows)
+        if: runner.os == 'Windows'
+        run: >-
+          python -m py_compile bin/codex-tier.py scripts/validate.py
+          tests/test_codex_tier.py tests/test_installer.py tests/test_validate.py
+          tests/test_windows.py tests/test_windows_installer.py
+      - name: Exercise POSIX strict installer dry-run
+        if: runner.os != 'Windows'
         run: |
           TEST_CODEX_HOME="$(python3 -c 'import os,tempfile; print(os.path.realpath(tempfile.mkdtemp()))')"
           trap 'rm -rf "$TEST_CODEX_HOME"' EXIT
           CODEX_TIER_PYTHON_BIN="$(python3 -c 'import os,sys; print(os.path.realpath(sys.executable))')" \
             ./install.sh --strict --dry-run --codex-home "$TEST_CODEX_HOME"
-      - name: Verify source tree unchanged
+      - name: Exercise native Windows fresh install
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $testHome = Join-Path $env:RUNNER_TEMP 'codex-tier-fresh-install'
+          & .\install.ps1 -CodexHome $testHome
+          if ($LASTEXITCODE -ne 0) { throw 'Windows installer failed' }
+          $env:CODEX_HOME = $testHome
+          $env:CODEX_TIER_PYTHON_BIN = (Get-Command python.exe).Source
+          & "$testHome\bin\codex-tier.cmd" --version
+          if ($LASTEXITCODE -ne 0) { throw 'Installed Windows command failed' }
+          Remove-Item -LiteralPath $testHome -Recurse -Force
+      - name: Verify source tree unchanged (POSIX)
+        if: runner.os != 'Windows'
         run: |
           git diff --exit-code
           test -z "$(git ls-files --others --exclude-standard)"
+      - name: Verify source tree unchanged (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          git diff --exit-code
+          if (git ls-files --others --exclude-standard) {
+            throw 'untracked files were created in the source tree'
+          }

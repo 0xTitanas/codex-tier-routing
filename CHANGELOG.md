@@ -10,6 +10,15 @@
   the caller's umask.
 - Expanded release gates to Ubuntu 22.04, 24.04, and 26.04 LTS and every
   supported Python minor from 3.11 through 3.14 where hosted runtimes exist.
+- Added native Windows installer and launcher support, including SID/DACL and
+  reparse-point checks, `LockFileEx` writer exclusion, Job Object containment,
+  atomic replacement, rollback, collision backups, and user `PATH` setup.
+  Native deterministic and installation checks plus manual negative and
+  all-six-route live checks pass in an interactive Windows 11 session,
+  including an independently verified `surgeon` diff. Codex CLI 0.144.4
+  sandboxed tool processes still exit before command execution with status
+  `0xc0000142` under OpenSSH/Session 0, which is outside the supported Windows
+  boundary.
 
 ## [1.1.0-rc.1] - 2026-07-14
 

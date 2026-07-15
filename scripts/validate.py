@@ -60,6 +60,9 @@ REQUIRED_PUBLIC_FILES = (
     "docs/releasing.md",
     "docs/threat-model.md",
     "policy.sample.toml",
+    "install.ps1",
+    "bin/codex-tier.cmd",
+    "bin/codex-tier-launcher.ps1",
     "schemas/local-dispatch-receipt.schema.json",
     "schemas/local-dispatch-envelope.schema.json",
     "schemas/local-dispatch-receipt-v3.schema.json",
@@ -93,7 +96,7 @@ PUBLIC_WINDOWS_HOME_PATTERN = re.compile(
 PUBLIC_IPV4_PATTERN = re.compile(r"(?<![0-9])(?:[0-9]{1,3}\.){3}[0-9]{1,3}(?![0-9])")
 PUBLIC_LAB_HOST_PATTERN = re.compile(r"\b[a-z][a-z0-9-]*-lab\b", re.IGNORECASE)
 
-CI_WORKFLOW_SHA256 = "d7a1fd52f156afaad5132fc49a456694cfae4b057b87e15373cdf51bf4751227"
+CI_WORKFLOW_SHA256 = "0afb05fd5945193ead375783be9cae497f21af286fe9745f6617d27c995e6fd1"
 
 
 def check_markers(path: Path, markers: tuple[str, ...], root: Path) -> int:
@@ -235,14 +238,14 @@ def check_public_privacy(root: Path) -> int:
 def check_ci_contract(root: Path) -> int:
     path = root / ".github" / "workflows" / "ci.yml"
     try:
-        digest = hashlib.sha256(path.read_bytes()).hexdigest()
+        digest = hashlib.sha256(path.read_bytes().replace(b"\r\n", b"\n")).hexdigest()
     except OSError as err:
         print(f"[FAIL] .github/workflows/ci.yml: unreadable ({err})")
         return 1
     if digest != CI_WORKFLOW_SHA256:
         print("[FAIL] .github/workflows/ci.yml: reviewed CI contract changed")
         return 1
-    print("[PASS] CI matches the reviewed 14-check matrix")
+    print("[PASS] CI matches the reviewed platform and Python matrix")
     return 0
 
 
@@ -418,6 +421,28 @@ def check_command(root: Path, command: list[str], label: str) -> int:
     return 0
 
 
+def check_powershell_syntax(root: Path, path: Path, label: str) -> int:
+    script = (
+        "& { param($Path) $tokens=$null; $errors=$null; "
+        "[Management.Automation.Language.Parser]::ParseFile($Path, "
+        "[ref]$tokens, [ref]$errors) | Out-Null; "
+        "if ($errors.Count) { $errors | ForEach-Object { Write-Error $_ }; exit 1 } }"
+    )
+    return check_command(
+        root,
+        [
+            "powershell.exe",
+            "-NoLogo",
+            "-NoProfile",
+            "-NonInteractive",
+            "-Command",
+            script,
+            str(path),
+        ],
+        label,
+    )
+
+
 def main() -> int:
     root = Path(__file__).resolve().parent.parent
     failures = 0
@@ -465,7 +490,7 @@ def main() -> int:
     ):
         schema_path = root / relative
         try:
-            raw = schema_path.read_bytes()
+            raw = schema_path.read_bytes().replace(b"\r\n", b"\n")
             json.loads(raw)
         except (OSError, UnicodeError, json.JSONDecodeError) as err:
             failures += 1
@@ -479,14 +504,29 @@ def main() -> int:
                 print(f"[PASS] {label} matches the reviewed contract")
 
     launcher = root / "bin" / "codex-tier"
+    windows_launcher = root / "bin" / "codex-tier.cmd"
+    powershell_launcher = root / "bin" / "codex-tier-launcher.ps1"
     dispatcher = root / "bin" / "codex-tier.py"
-    if not launcher.is_file() or not os.access(launcher, os.X_OK):
+    if not launcher.is_file() or (os.name != "nt" and not os.access(launcher, os.X_OK)):
         failures += 1
         print("[FAIL] bin/codex-tier: launcher missing or not executable")
-    else:
+    elif os.name != "nt":
         failures += check_command(
             root, ["/bin/sh", "-n", str(launcher)], "bin/codex-tier shell syntax"
         )
+    if os.name == "nt":
+        if not windows_launcher.is_file():
+            failures += 1
+            print("[FAIL] bin/codex-tier.cmd: launcher missing")
+        if not powershell_launcher.is_file():
+            failures += 1
+            print("[FAIL] bin/codex-tier-launcher.ps1: launcher missing")
+        else:
+            failures += check_powershell_syntax(
+                root,
+                powershell_launcher,
+                "bin/codex-tier-launcher.ps1 PowerShell syntax",
+            )
     if not dispatcher.is_file():
         failures += 1
         print("[FAIL] bin/codex-tier.py: runtime missing")
@@ -511,9 +551,14 @@ def main() -> int:
         else:
             print("[PASS] bin/codex-tier.py: runtime compiles")
 
-    failures += check_command(
-        root, ["/bin/sh", "-n", "install.sh"], "install.sh shell syntax"
-    )
+    if os.name == "nt":
+        failures += check_powershell_syntax(
+            root, root / "install.ps1", "install.ps1 PowerShell syntax"
+        )
+    else:
+        failures += check_command(
+            root, ["/bin/sh", "-n", "install.sh"], "install.sh shell syntax"
+        )
 
     required_agent_fields = (
         "name",

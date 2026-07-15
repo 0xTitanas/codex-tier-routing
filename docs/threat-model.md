@@ -37,7 +37,8 @@ multi-agent feature when the active CLI honors the documented feature override.
 The implementation trusts:
 
 - the operating-system kernel and filesystem metadata;
-- root;
+- root and the trusted Windows system-owner identities documented by the native
+  ACL checks;
 - the effective operating-system user running the installer and dispatcher;
 - any identity that can write a runtime-path component which the effective user
   owns and deliberately leaves group-writable;
@@ -45,12 +46,12 @@ The implementation trusts:
 - the installed Codex CLI to write truthful local rollout fields; and
 - the operator to verify worker output and workspace effects independently.
 
-Root-owned and effective-user-owned runtime paths are accepted. World-writable
-runtime components are rejected. A group-writable component is accepted only
-when the effective user owns it, which supports common owner-managed package
-manager layouts. Other members with write access to that directory are inside
-the trust boundary; installations that require protection from those members
-must remove group write before use.
+On POSIX, root-owned and effective-user-owned runtime paths are accepted and
+world-writable components are rejected. A group-writable component is accepted
+only when the effective user owns it, which supports common owner-managed
+package-manager layouts. Other members with write access to that directory are
+inside the trust boundary. Windows uses its documented SID owner allowlist and
+rejects dangerous DACL grants to other identities.
 
 ## Defended failure classes
 
@@ -69,8 +70,10 @@ must remove group write before use.
   evidence;
 - unbounded stdout, stderr, prompt, rollout, or ledger-entry growth;
 - concurrent write-capable routes targeting the same workdir;
-- blind retries after an ambiguous write-capable outcome; and
-- handled installer failures that would otherwise leave a partial bundle.
+- blind retries after an ambiguous write-capable outcome;
+- handled installer failures that would otherwise leave a partial bundle; and
+- Windows reparse-point/junction traversal, unsafe DACL ownership, and escaped
+  child processes through native path, lock, and Job Object controls.
 
 ## Explicit exclusions
 
@@ -78,7 +81,7 @@ The project does not defend against:
 
 - root, the current operating-system identity, or another trusted writer
   replacing files and recomputing hashes;
-- availability against another local identity pre-creating the predictable
+- POSIX availability against another local identity pre-creating the predictable
   owner-private writer-lock path in the sticky system temporary directory;
 - a same-identity race between path validation and process execution;
 - a compromised kernel, Python runtime, Codex binary, Codex host, or provider;

@@ -10,9 +10,9 @@ boundary only after the release gates below pass.
 | macOS on Apple silicon | Local installer, dispatcher, and live read-only route checks |
 | Ubuntu Linux on x86-64 | 22.04 and 24.04 LTS on Python 3.11-3.14; 26.04 LTS on its system Python 3.14 |
 | Other Linux distributions or architectures | Outside the release-gated compatibility boundary |
-| Windows | Not supported |
+| Windows 11 | Native CI and fresh install plus manual dispatcher, negative-canary, and all-six-route live checks in an interactive console/RDP session; OpenSSH/Session 0 is excluded for Codex CLI 0.144.4 as described below |
 | Python | 3.11-3.14 in CI; runtime requires 3.11 or newer |
-| Codex CLI | 0.144.4 used for bounded local canaries |
+| Codex CLI | 0.144.4 used for bounded POSIX and native Windows checks |
 
 The prior recorded Codex checks covered a narrow local environment and small
 tasks. Before the v1.1.0-rc.1 tag, the remapped Terra/low `scout`, remapped
@@ -48,9 +48,37 @@ succeed; use one bounded canary per changed route.
 
 ## Platform notes
 
-The dispatcher depends on Unix process groups, advisory file locks, ownership
-checks, and no-follow file opens. These are why Windows is not currently
-supported.
+Windows uses native equivalents: SID-based owner/DACL validation, reparse-point
+and junction rejection, `LockFileEx` writer locks, suspended-process Job Object
+containment, and `MoveFileEx` replacement. Install with `install.ps1`; it performs
+transactional rollback, timestamped collision backups, and a user `PATH` update.
+Run `bin\\codex-tier.cmd` from a fresh interactive console or RDP session.
+Write-capable routes preserve an explicit `[windows] sandbox = "elevated"`
+setting and otherwise select Codex's documented `unelevated` fallback.
+
+In a manual check on the tested Codex CLI 0.144.4 host, authenticated dispatch
+and receipt verification succeeded for all six routes from an interactive
+Windows session. The `surgeon` canary ran in a clean linked Git worktree under
+the elevated sandbox; its starting HEAD and exact one-line diff were
+independently verified. Dirty-worktree and active writer-lock checks halted
+before unsafe execution.
+
+Codex CLI 0.144.4 still cannot initialize sandboxed tool processes when launched
+from native Windows OpenSSH/Session 0. In `unelevated` mode, model-invoked
+helpers exit with Windows status `0xc0000142`. Elevated sandbox setup succeeds,
+but its signed command runner exits with the same status before opening its
+named pipes, so the parent times out. Direct `codex exec` and `codex sandbox`
+reproductions outside this dispatcher establish the Codex CLI process-start
+boundary.
+
+This Windows SSH/Remote-SSH failure is tracked in upstream
+[issue #17847](https://github.com/openai/codex/issues/17847) and
+[issue #20346](https://github.com/openai/codex/issues/20346). Disabling the
+sandbox or broadening window-station ACLs is not an acceptable workaround. Use
+an interactive console or RDP session for supported Windows dispatches;
+OpenSSH/Session 0 remains outside the supported boundary until the CLI is fixed
+and the native canaries are rerun. See Codex's
+[Windows sandbox documentation](https://developers.openai.com/codex/windows).
 
 The Ubuntu 22.04 and 24.04 jobs cover every supported Python minor. The Ubuntu
 26.04 job uses and verifies the image's system Python 3.14 while that hosted
