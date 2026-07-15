@@ -1076,16 +1076,30 @@ class DispatcherTests(unittest.TestCase):
         )
         fake_codex.chmod(0o755)
         env = os.environ.copy()
+        loader_env = {"LD_PRELOAD": str(self.base / "evil.so")}
+        if sys.platform == "darwin":
+            # dyld processes this variable before /bin/sh can unset it, so a
+            # missing test dylib would abort before the launcher runs.
+            launcher_source = self.launcher.read_text(encoding="utf-8")
+            self.assertIn(
+                "unset DYLD_INSERT_LIBRARIES DYLD_LIBRARY_PATH DYLD_FRAMEWORK_PATH",
+                launcher_source,
+            )
+            self.assertLess(
+                launcher_source.index("unset DYLD_INSERT_LIBRARIES"),
+                launcher_source.index("PYTHON_BIN="),
+            )
+        else:
+            loader_env["DYLD_INSERT_LIBRARIES"] = str(self.base / "evil.dylib")
         env.update(
             {
                 "CODEX_HOME": str(self.home),
                 "CODEX_TIER_CODEX_BIN": str(fake_codex),
-                "LD_PRELOAD": str(self.base / "evil.so"),
-                "DYLD_INSERT_LIBRARIES": str(self.base / "evil.dylib"),
                 "PYTHONPATH": str(self.base / "evil"),
                 "PYTHONSTARTUP": str(self.base / "evil.py"),
                 "PYTHONHOME": str(self.base / "evil-home"),
                 "EVIL_EXTRA": "should_not_propagate",
+                **loader_env,
             }
         )
         result = subprocess.run(
@@ -1123,14 +1137,26 @@ class DispatcherTests(unittest.TestCase):
         )
         fake_codex.chmod(0o755)
         env = os.environ.copy()
+        loader_env = {"LD_PRELOAD": str(self.base / "evil.so")}
+        if sys.platform == "darwin":
+            launcher_source = self.launcher.read_text(encoding="utf-8")
+            self.assertIn(
+                "unset DYLD_INSERT_LIBRARIES DYLD_LIBRARY_PATH DYLD_FRAMEWORK_PATH",
+                launcher_source,
+            )
+            self.assertLess(
+                launcher_source.index("unset DYLD_INSERT_LIBRARIES"),
+                launcher_source.index("PYTHON_BIN="),
+            )
+        else:
+            loader_env["DYLD_INSERT_LIBRARIES"] = str(self.base / "evil.dylib")
         env.update(
             {
                 "CODEX_HOME": str(self.home),
                 "CODEX_TIER_CODEX_BIN": str(fake_codex),
                 "PYTHONPATH": str(startup),
                 "PYTHONHOME": str(self.base / "evil-home"),
-                "LD_PRELOAD": str(self.base / "evil.so"),
-                "DYLD_INSERT_LIBRARIES": str(self.base / "evil.dylib"),
+                **loader_env,
             }
         )
         result = subprocess.run(

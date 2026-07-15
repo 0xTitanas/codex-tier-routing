@@ -95,7 +95,7 @@ PUBLIC_WINDOWS_HOME_PATTERN = re.compile(
 PUBLIC_IPV4_PATTERN = re.compile(r"(?<![0-9])(?:[0-9]{1,3}\.){3}[0-9]{1,3}(?![0-9])")
 PUBLIC_LAB_HOST_PATTERN = re.compile(r"\b[a-z][a-z0-9-]*-lab\b", re.IGNORECASE)
 
-CI_WORKFLOW_SHA256 = "4ffbc59f598643063116d971e99a6a41a012ae2a2d93034b8e7bc29802f11395"
+CI_WORKFLOW_SHA256 = "75547bd7d24c8a3dd1905916b16f904bb79654ddce66fc11b2b4e5e41b1b54b0"
 
 
 def check_markers(path: Path, markers: tuple[str, ...], root: Path) -> int:

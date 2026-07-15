@@ -66,13 +66,50 @@ jobs:
           python-version: ${{ matrix.python }}
       - name: Verify system Python
         if: ${{ matrix.system_python }}
-        run: test "$(python3 -c 'import sys; print(f\"{sys.version_info.major}.{sys.version_info.minor}\")')" = "${{ matrix.python }}"
-      - name: Prepare safe interpreter for trust validation
-        if: runner.os != 'Windows'
+        run: test "$(python3 -c 'import sys; print(f"{sys.version_info.major}.{sys.version_info.minor}")')" = "${{ matrix.python }}"
+      - name: Harden macOS tool paths
+        if: runner.os == 'macOS'
+        shell: bash
         run: |
-          SAFE_VENV="$RUNNER_TEMP/safe-python"
-          python3 -m venv --copies "$SAFE_VENV"
-          echo "$SAFE_VENV/bin" >> "$GITHUB_PATH"
+          FRAMEWORK_VERSIONS="$(python3 -c 'from pathlib import Path; import sys; print(Path(sys.base_prefix).resolve().parent)')"
+          FRAMEWORK_INTERPRETER="$(python3 -c 'from pathlib import Path; import sys; print(Path(sys.executable).resolve())')"
+          test "$(basename "$FRAMEWORK_VERSIONS")" = "Versions"
+          case "$FRAMEWORK_INTERPRETER" in
+            "$FRAMEWORK_VERSIONS"/*) ;;
+            *) echo 'resolved Python interpreter is outside the validated framework path' >&2; exit 1 ;;
+          esac
+          FRAMEWORK_COMPONENT="$FRAMEWORK_INTERPRETER"
+          while :; do
+            test "$(stat -f '%u' "$FRAMEWORK_COMPONENT")" = 0
+            sudo chmod go-w "$FRAMEWORK_COMPONENT"
+            test "$FRAMEWORK_COMPONENT" = "$FRAMEWORK_VERSIONS" && break
+            FRAMEWORK_COMPONENT="${FRAMEWORK_COMPONENT%/*}"
+          done
+          python3 - "$FRAMEWORK_VERSIONS" "$FRAMEWORK_INTERPRETER" <<'PY'
+          import os
+          import stat
+          import sys
+
+          root, executable = (os.path.realpath(value) for value in sys.argv[1:])
+          relative = os.path.relpath(executable, root)
+          if relative == os.pardir or relative.startswith(os.pardir + os.sep):
+              raise SystemExit("resolved Python interpreter is outside the validated framework path")
+          current = root
+          for component in ("", *relative.split(os.sep)):
+              if component:
+                  current = os.path.join(current, component)
+              details = os.stat(current)
+              if details.st_uid != 0:
+                  raise SystemExit(f"non-root framework component: {current}")
+              if details.st_mode & (stat.S_IWGRP | stat.S_IWOTH):
+                  raise SystemExit(f"writable framework component: {current}")
+          PY
+          echo "CODEX_TIER_PYTHON_BIN=$FRAMEWORK_INTERPRETER" >> "$GITHUB_ENV"
+          SAFE_GIT_BIN="$RUNNER_TEMP/codex-tier-safe-bin"
+          mkdir -m 700 "$SAFE_GIT_BIN"
+          ln -s /usr/bin/git "$SAFE_GIT_BIN/git"
+          "$SAFE_GIT_BIN/git" --version
+          echo "$SAFE_GIT_BIN" >> "$GITHUB_PATH"
       - name: Validate repository (POSIX)
         if: runner.os != 'Windows'
         run: python3 scripts/validate.py
@@ -127,8 +164,8 @@ jobs:
       - name: Verify source tree unchanged (POSIX)
         if: runner.os != 'Windows'
         run: |
-          git diff --exit-code
-          test -z "$(git ls-files --others --exclude-standard)"
+          /usr/bin/git diff --exit-code
+          test -z "$(/usr/bin/git ls-files --others --exclude-standard)"
       - name: Verify source tree unchanged (Windows)
         if: runner.os == 'Windows'
         shell: pwsh

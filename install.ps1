@@ -99,8 +99,9 @@ function Invoke-TestFailure([string]$Point) {
 function Assert-SafeAcl([string]$Path, [string]$Label, [bool]$Final) {
     try {
         $acl = Get-Acl -LiteralPath $Path
-        $sections = [Security.AccessControl.AccessControlSections]::Owner -bor [Security.AccessControl.AccessControlSections]::Access
-        $descriptor = New-Object Security.AccessControl.RawSecurityDescriptor($acl.GetSecurityDescriptorSddlForm($sections))
+        $descriptor = [Security.AccessControl.RawSecurityDescriptor]::new(
+            $acl.GetSecurityDescriptorBinaryForm(), 0
+        )
     } catch {
         Fail "unable to inspect the Windows ACL for $Label"
     }
