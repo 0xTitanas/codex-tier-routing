@@ -468,7 +468,7 @@ jobs:
             ./install.sh --strict --dry-run --codex-home "$TEST_CODEX_HOME"
       - name: Exercise native Windows fresh install
         if: runner.os == 'Windows'
-        shell: pwsh
+        shell: powershell
         run: |
           Set-Location -LiteralPath $env:CODEX_TIER_CI_SOURCE_ROOT
           $env:USERPROFILE = $env:CODEX_TIER_CI_PRIVATE_ROOT
