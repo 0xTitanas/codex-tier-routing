@@ -1,0 +1,71 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/0xTitanas/codex-tier-routing/schemas/local-dispatch-envelope-v3.schema.json",
+  "title": "Codex Tier Routing Local Dispatch Envelope v3",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "receipt",
+    "receipt_ref",
+    "result"
+  ],
+  "properties": {
+    "receipt": {
+      "$ref": "local-dispatch-receipt-v3.schema.json"
+    },
+    "receipt_ref": {
+      "type": "string",
+      "pattern": "^local-ledger://[0-9a-f]{64}$"
+    },
+    "result": {
+      "type": [
+        "string",
+        "null"
+      ]
+    }
+  },
+  "oneOf": [
+    {
+      "properties": {
+        "receipt": {
+          "allOf": [
+            {
+              "$ref": "local-dispatch-receipt-v3.schema.json"
+            },
+            {
+              "properties": {
+                "status": {
+                  "const": "pass"
+                }
+              }
+            }
+          ]
+        },
+        "result": {
+          "type": "string"
+        }
+      }
+    },
+    {
+      "properties": {
+        "receipt": {
+          "allOf": [
+            {
+              "$ref": "local-dispatch-receipt-v3.schema.json"
+            },
+            {
+              "properties": {
+                "status": {
+                  "const": "halt"
+                }
+              }
+            }
+          ]
+        },
+        "result": {
+          "type": "null"
+        }
+      }
+    }
+  ]
+}

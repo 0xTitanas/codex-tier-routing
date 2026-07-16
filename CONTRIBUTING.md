@@ -22,10 +22,25 @@ python -m unittest discover -s tests -v
 sh -n install.sh
 sh -n bin/codex-tier
 PYTHONPYCACHEPREFIX=/tmp/codex-tier-pycache python -m py_compile \
-  bin/codex-tier.py scripts/validate.py tests/test_codex_tier.py tests/test_installer.py
+  bin/codex-tier.py scripts/validate.py tests/test_codex_tier.py \
+  tests/test_installer.py tests/test_validate.py tests/test_windows.py \
+  tests/test_windows_installer.py
 ruff check .
 ruff format --check scripts tests bin/codex-tier.py
 ```
+
+Windows contributors should additionally run:
+
+```powershell
+python scripts\validate.py
+python -m unittest discover -s tests -v
+powershell -NoProfile -File .\install.ps1 -Strict -DryRun
+```
+
+Then exercise `codex-tier probe` and a bounded workspace-write canary from a
+fresh interactive PowerShell console or RDP session, and independently inspect
+the resulting diff. Do not use OpenSSH/Session 0 for that live canary with Codex
+CLI 0.144.4; see `docs/compatibility.md` for the current CLI limitation.
 
 ## Pull request expectations
 

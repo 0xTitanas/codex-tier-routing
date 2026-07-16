@@ -924,8 +924,8 @@ fi
 rm -rf "$STAGE_ROOT"
 STAGE_ROOT=
 
-# Disable only an unchanged strict configuration managed by this installation.
-# A drifted config halts before removing the helper so the user can reconcile it.
+# Disable only the strict setting managed by this installation. Unrelated
+# appended sections survive; a conflicting edit halts before helper removal.
 if [ "$STRICT" -eq 1 ]; then
   uninstall_codex_bin=
   if [ "${CODEX_TIER_CODEX_BIN+x}" = x ]; then

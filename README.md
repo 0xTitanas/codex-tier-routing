@@ -5,8 +5,8 @@
 **Stable Codex task routes, configurable model/effort mappings, and host-observed receipts.**
 
 [![License: MIT](https://img.shields.io/badge/license-MIT-2ea44f.svg)](LICENSE)
-[![Release: v1.0.0-rc.2](https://img.shields.io/badge/release-v1.0.0--rc.2-f0ad4e.svg)](CHANGELOG.md)
-[![Platforms: macOS + Linux](https://img.shields.io/badge/platforms-macOS%20%2B%20Linux-4c78ff.svg)](docs/compatibility.md)
+[![Release: v1.1.0-rc.1](https://img.shields.io/badge/release-v1.1.0--rc.1-f0ad4e.svg)](CHANGELOG.md)
+[![Platforms: macOS + Linux + Windows](https://img.shields.io/badge/platforms-macOS%20%2B%20Linux%20%2B%20Windows-4c78ff.svg)](docs/compatibility.md)
 
 </div>
 
@@ -17,7 +17,7 @@ Original project by <a href="https://github.com/0xTitanas">0xTitanas</a> ·
 <a href="https://github.com/0xTitanas/codex-tier-routing">Canonical repository</a>
 </p>
 
-`codex-tier-routing` installs five Codex agent profiles and a local dispatcher.
+`codex-tier-routing` installs six Codex agent profiles and a local dispatcher.
 The profiles make task intent explicit. The dispatcher adds the part a profile
 cannot provide on its own: a host-observed receipt that records the model,
 effort, sandbox, approval policy, working directory, and child session seen in
@@ -28,9 +28,9 @@ not endorsed by or affiliated with OpenAI. It uses documented Codex CLI and
 configuration behavior, but its rollout parsing and compatibility assertions
 remain this project's responsibility.
 
-The current release candidate is `v1.0.0-rc.2`. It is feature-complete within
-the documented compatibility boundary and is prepared for clean-runner and
-independent-install validation before the stable `v1.0.0` tag.
+The current release candidate is `v1.1.0-rc.1`. It remains a candidate until
+the documented clean-runner, independent-install, and changed-route canary
+gates pass.
 
 The project does not prove provider-side model identity, measure cost or
 quality improvements, or make delegated output trustworthy by itself. The
@@ -42,21 +42,29 @@ must have access to each configured model.
 
 | Route | Default model | Default effort | Fixed sandbox | Typical use |
 |---|---|---|---|---|
-| `scout` | `gpt-5.6-luna` | low | read-only | Search, dependency surveys, documentation lookup |
+| `scout` | `gpt-5.6-terra` | low | read-only | Search, dependency surveys, documentation lookup |
 | `grunt` | `gpt-5.6-luna` | low | workspace-write | Formatting, boilerplate, mechanical edits |
 | `builder` | `gpt-5.6-terra` | medium | workspace-write | Scoped features, fixes, tests, and refactors |
-| `reviewer` | `gpt-5.6-terra` | high | read-only | Correctness, security, and coverage review |
+| `reviewer` | `gpt-5.6-sol` | high | read-only | Correctness, security, and coverage review |
 | `architect` | `gpt-5.6-sol` | xhigh | read-only | Difficult design decisions |
+| `surgeon` | `gpt-5.6-sol` | high | workspace-write | Bounded cross-cutting refactors, migrations, and difficult multi-file fixes |
 
 These defaults work without a policy file. An owner may change only the model
-and effort mapping through one validated TOML file. Route names, sandbox modes,
-network posture, approval policy, and concurrency limits remain fixed in code.
+and effort mapping for the five stable routes through one validated TOML file.
+The experimental `surgeon` tuple, route names, sandbox modes, network posture,
+approval policy, and concurrency limits remain fixed in code.
+
+`surgeon` is the highest-blast-radius route. Use it only in a clean linked Git
+worktree with explicit completion criteria, and require parent review before
+integration. Its enforced preflight currently rejects submodules and any Git
+`filter` attributes to avoid running repository-configured helpers outside the
+Codex sandbox.
 
 ## How it works
 
 ```text
 Task
-  -> choose one stable route
+  -> choose one recognized route
   -> load and validate the active model/effort policy
   -> run codex exec with fixed authority boundaries
   -> read the host-written rollout
@@ -80,16 +88,22 @@ parent may also remain single-agent when delegation is unnecessary.
 - [Git](https://git-scm.com/downloads/)
 - An installed [Codex CLI](https://developers.openai.com/codex/cli) with
   `codex exec`
+- On Windows, a native `codex.exe` entrypoint. Windows `.cmd` and `.bat`
+  wrappers are outside the tested trust boundary and are rejected before
+  dispatch.
 - A working Codex login for that CLI
 - Access to the configured model names
-- macOS or Linux; Windows is not currently supported
+- macOS, x86-64 Ubuntu 22.04, 24.04, or 26.04 LTS, or native Windows 11. With
+  Codex CLI 0.144.4, run Windows dispatches from an interactive console or RDP
+  session; OpenSSH/Session 0 is outside the supported boundary (see
+  [compatibility](docs/compatibility.md)).
 
 See [compatibility](docs/compatibility.md) for the tested boundary.
 
 ## Quick start
 
-Install the prerequisites above and sign in to Codex. These checks should all
-succeed, and the first must report Python 3.11 or newer:
+Install the prerequisites above and sign in to Codex. On macOS or Linux, these
+checks should all succeed, and the first must report Python 3.11 or newer:
 
 ```sh
 python3 --version
@@ -106,8 +120,8 @@ git clone https://github.com/0xTitanas/codex-tier-routing.git
 cd codex-tier-routing
 ```
 
-Review `install.sh`, validate the package, and preview the strict installation
-without changing your Codex home:
+On macOS or Linux, review `install.sh`, validate the package, and preview the
+strict installation without changing your Codex home:
 
 ```sh
 python3 scripts/validate.py
@@ -120,8 +134,35 @@ If both commands pass, install into `${CODEX_HOME:-$HOME/.codex}`:
 ./install.sh --strict
 ```
 
-Keep the exact uninstall command printed at the end. Restart every Codex surface
-using that home, open a new session, and verify the installation:
+On Windows, use PowerShell from the repository root:
+
+```powershell
+python --version
+git --version
+$codexPath = (Get-Command codex -CommandType Application -ErrorAction Stop | Select-Object -First 1).Source
+if ([IO.Path]::GetExtension($codexPath) -ne '.exe') { throw 'codex-tier requires a native codex.exe on Windows' }
+& $codexPath --version
+& $codexPath login status
+python scripts\validate.py
+powershell.exe -NoLogo -NoProfile -ExecutionPolicy Bypass -File .\install.ps1 -Strict -DryRun
+powershell.exe -NoLogo -NoProfile -ExecutionPolicy Bypass -File .\install.ps1 -Strict
+powershell.exe -NoLogo -NoProfile -ExecutionPolicy Bypass -File "$env:USERPROFILE\.codex\bin\codex-tier.ps1" probe
+```
+
+If the Windows login check reports that you are signed out, run
+`& $codexPath login` and complete the sign-in flow before installing.
+
+The native installer uses owner-only ACLs, transactional rollback, and
+timestamped collision backups. It adds the install `bin` directory to the user
+`PATH`; open a fresh interactive console or RDP session before invoking
+`codex-tier` by name.
+
+The commands above use a process-scoped execution-policy override. The
+installer does not change the user's or machine's execution policy.
+
+On macOS and Linux, keep the exact uninstall command printed at the end.
+Restart every Codex surface using that home, open a new session, and verify the
+installation:
 
 ```sh
 "${CODEX_HOME:-$HOME/.codex}/bin/codex-tier" probe
@@ -147,6 +188,22 @@ raise SystemExit(not passed)
 '
 ```
 
+On Windows, run the equivalent canary from a fresh interactive PowerShell
+console or RDP session:
+
+```powershell
+$launcher = "$env:USERPROFILE\.codex\bin\codex-tier.ps1"
+$raw = 'Reply exactly ROUTE_CANARY_OK. Do not inspect files.' | powershell.exe -NoLogo -NoProfile -ExecutionPolicy Bypass -File $launcher dispatch --route scout --workdir (Get-Location).Path
+$dispatchExit = $LASTEXITCODE
+$envelope = $raw | ConvertFrom-Json
+$passed = $dispatchExit -eq 0 -and $envelope.receipt.status -eq 'pass' -and $envelope.result -eq 'ROUTE_CANARY_OK'
+if (-not $passed) {
+    $envelope | ConvertTo-Json -Depth 20
+    throw 'Canary failed.'
+}
+'Canary passed.'
+```
+
 Continue only when the verifier prints `Canary passed.` It requires both a
 passing receipt and the exact expected result. The receipt shows what the local
 Codex host recorded; it does not prove provider-side model identity or that
@@ -165,15 +222,20 @@ The strict installer copies:
 - `skills/model-routing/` to `$CODEX_HOME/skills/model-routing/`
 - `bin/codex-tier` and `bin/codex-tier.py` to `$CODEX_HOME/bin/`
 
+On Windows, `install.ps1` copies the same six profiles and skill plus
+`codex-tier.ps1` and `codex-tier.py` to the
+corresponding `%CODEX_HOME%` directories.
+
 When native generic subagent spawning is not already disabled, it also updates
 `$CODEX_HOME/config.toml` and retains the previous bytes for a guarded restore.
 If that setting was already disabled outside this project, the installer leaves
 it unmanaged and does not create a configuration backup.
 
-If `CODEX_HOME` is unset, the installer uses `$HOME/.codex`. Existing files are
-moved into an owner-only timestamped backup tree before replacement. The
-installer prints an exact uninstall command for the files and strict
-configuration it manages.
+If `CODEX_HOME` is unset, the POSIX installer uses `$HOME/.codex` and the
+Windows installer uses `%USERPROFILE%\.codex`. Existing files are moved into an
+owner-only timestamped backup tree before replacement. The POSIX installer
+prints an exact uninstall command for the files and strict configuration it
+manages; the Windows installer does not generate an uninstall command.
 
 ## Test in an isolated Codex home
 
@@ -204,16 +266,19 @@ install -m 600 policy.sample.toml "$POLICY_DIR/policy.toml"
 
 Edit only `model` and `effort` in
 `${CODEX_HOME:-$HOME/.codex}/tier-routing/policy.toml`. The file must retain
-all five routes and remain mode `0600`; its directory must remain mode `0700`.
+all five configurable routes and remain mode `0600`; its directory must remain
+mode `0700`. `surgeon` is experimental and is not configurable through
+`policy.toml` in this release.
 `policy-check` is offline: it rejects unknown fields, unsafe model-ID syntax,
 and unsupported effort values, then prints the fully resolved mapping and the
 accepted effort list.
 
 This release accepts `none`, `low`, `medium`, `high`, `xhigh`, and `max`, the
-reasoning-effort set published for the default GPT-5.6 family. It intentionally
-does not accept `minimal` or `ultra`. A syntactically valid model name is not
+reasoning-effort set published for the default GPT-5.6 family. `minimal` is
+prior-generation vocabulary, and `ultra` remains outside this release's tested
+and attested dispatcher boundary. A syntactically valid model name is not
 proof that the current account can use it or that a different model supports
-the selected effort. Codex CLI 0.144.1 does not expose a trusted
+the selected effort. Codex CLI 0.144.4 does not expose a trusted
 account-entitlement list, so `policy-check` reports
 `model_access: not_checked`. After each model or effort change, run one bounded
 canary for every changed route. A failed canary HALTs; the dispatcher never
@@ -236,20 +301,30 @@ disabled. To restore the configuration that `strict-enable` managed:
 ```
 
 Restart every Codex surface using that home afterward. The command restores the
-previous configuration only when the managed file has not drifted; otherwise it
-HALTs rather than overwriting newer changes.
+managed `features.multi_agent` value while preserving unrelated appended
+sections, including host-added project trust metadata. It HALTs without
+overwriting the file if that managed setting changed or the edit is otherwise
+ambiguous.
 
-To uninstall, run the exact uninstall command printed by the successful
+On macOS and Linux, run the exact uninstall command printed by the successful
 installer. It restores any strict configuration managed by that installation
-before removing the installed profiles, skill, and dispatcher. Backup trees,
-custom policy, and the local receipt ledger are retained for manual inspection
-or removal. If native spawning was already disabled before installation,
-disable and uninstall leave that setting unchanged.
+before removing the installed profiles, skill, and dispatcher. On Windows, run
+`strict-disable`, then inspect and remove only the installed files and matching
+user `PATH` entry manually; `install.ps1` does not automate uninstall. Backup
+trees, custom policy, and the local receipt ledger are retained for manual
+inspection or removal. If native spawning was already disabled before
+installation, disable and uninstall leave that setting unchanged.
+
+Writer-lock files under `/tmp/codex-tier-routing-<uid>-locks` on POSIX and
+`%LOCALAPPDATA%\codex-tier-routing-<SID>-locks` on Windows are also retained to
+avoid split-inode races. Remove that owner-only directory only when no routed
+dispatch can still be running as that operating-system identity.
 
 ## Commands
 
-The installer does not modify `PATH`. In the summary below, `codex-tier` means
-`${CODEX_HOME:-$HOME/.codex}/bin/codex-tier`.
+The POSIX installer does not modify `PATH`; there, `codex-tier` below means
+`${CODEX_HOME:-$HOME/.codex}/bin/codex-tier`. The Windows installer adds its
+`bin` directory to the user `PATH`, effective in a new shell.
 
 ```text
 codex-tier --version
@@ -285,8 +360,9 @@ Treat every `HALT` as a failed setup or dispatch; do not continue past it.
 - If the canary reports an unavailable model or effort, confirm account access
   or update the owner-only policy, run `policy-check`, and retry one bounded
   canary. The dispatcher does not silently fall back to another model.
-- If `codex-tier` is not found, invoke it through the full path shown throughout
-  this README; installation does not add its directory to `PATH`.
+- If `codex-tier` is not found on macOS or Linux, invoke it through the full
+  path shown throughout this README. On Windows, open a new shell after install
+  or invoke `& "$env:CODEX_HOME\bin\codex-tier.ps1"` directly.
 
 ## Security boundary
 
@@ -294,12 +370,16 @@ The installer and dispatcher:
 
 - reject symlinked, cross-owner, and unsafe writable Codex-home paths;
 - resolve the Codex executable from an absolute, owner-checked path;
-- run installer filesystem utilities through the platform's system utility path;
+- run POSIX installer filesystem utilities through the platform's system utility
+  path and use native PowerShell/.NET filesystem APIs on Windows;
 - validate lexical and resolved Python interpreter paths before strict installation;
 - start strict-mode Python processes with a minimal environment;
-- launch the installed dispatcher through a hardened `/bin/sh` wrapper that
-  clears loader and Python startup variables before resolving the interpreter;
-- invoke script-based Codex entrypoints through an independently validated
+- launch the installed dispatcher through a hardened `/bin/sh` wrapper on
+  POSIX or an owner-validated PowerShell script on Windows; both clear Python
+  startup variables before resolving the interpreter;
+- require a native Codex executable on Windows and reject `.cmd` and `.bat`
+  entrypoints before dispatch;
+- invoke script-based POSIX Codex entrypoints through an independently validated
   shebang runtime instead of allowing the kernel to resolve it again;
 - bind launcher, dispatcher source, Python interpreter, Codex entrypoint, and
   Codex runtime paths and hashes into each receipt;
@@ -309,18 +389,22 @@ The installer and dispatcher:
   and the complete effective policy into each receipt;
 - run `codex exec --strict-config`, force workspace network off and extra
   writable roots empty at launch, and fail closed unless the host rollout uses
-  Codex 0.144.1's canonical empty-root encoding; receipts normalize that
+  Codex 0.144.4's canonical empty-root encoding; receipts normalize that
   verified omission to an explicit `writable_roots: []`;
 - launch each child with approval policy `never` and verify the observed
   value afterward;
-- kill the child process group on timeout or stream failure;
+- prevent concurrent write-capable routes from targeting the same resolved
+  workdir identity across Codex homes used by the same operating-system
+  identity;
+- kill the POSIX child process group or contained Windows Job Object on timeout
+  or stream failure;
 - record a halt instead of accepting missing or mismatched observations.
 
 The Codex process receives an explicit environment containing the validated
-home boundaries plus `PATH` and locale/terminal values. Arbitrary caller
-variables and environment-only API credentials are not forwarded. This is
-still not a credential-isolation boundary: Codex can use its normal saved login
-state, and its session files contain task and output data.
+home boundaries plus a narrow platform allowlist including `PATH`.
+Environment-only API credentials and arbitrary caller variables are not
+forwarded. This is still not a credential-isolation boundary: Codex can use its
+normal saved login state, and its session files contain task and output data.
 
 The `read-only` and `workspace-write` labels describe the host-observed local
 shell/filesystem sandbox. They do not attest provider behavior or make every
@@ -335,8 +419,13 @@ Read [SECURITY.md](SECURITY.md) and the
 
 ## Platform support
 
-- macOS and Linux are tested and supported today.
-- Windows support is actively in development — not yet ready for use.
+- macOS and x86-64 Ubuntu 22.04, 24.04, and 26.04 LTS are tested and supported
+  today. Other Linux distributions and architectures are outside the
+  release-gated compatibility boundary.
+- Native Windows 11 is tested and supported.
+- On Windows, run dispatches from an interactive console or RDP session. Codex
+  CLI 0.144.4 sandboxed tool processes exit before command execution under
+  OpenSSH/Session 0, so that host mode is outside the supported boundary.
 
 ## Limits
 
@@ -352,8 +441,9 @@ Read [SECURITY.md](SECURITY.md) and the
   attestation claim is made.
 - Model-name syntax validation is not account-access validation. Use a bounded
   canary to test each configured mapping.
-- The trust model excludes root, the current operating-system identity, and any
-  identity able to write a trusted runtime ancestor. See the
+- The trust model excludes root, trusted Windows system-owner identities, the
+  current operating-system identity, and any identity able to write a trusted
+  runtime ancestor. See the
   [threat model](docs/threat-model.md).
 
 ## Development
@@ -369,25 +459,31 @@ python -m unittest discover -s tests -v
 sh -n install.sh
 sh -n bin/codex-tier
 PYTHONPYCACHEPREFIX=/tmp/codex-tier-pycache python -m py_compile \
-  bin/codex-tier.py scripts/validate.py tests/test_codex_tier.py tests/test_installer.py
+  bin/codex-tier.py scripts/validate.py tests/test_codex_tier.py \
+  tests/test_installer.py tests/test_validate.py tests/test_windows.py \
+  tests/test_windows_installer.py
 ruff check .
 ruff format --check scripts tests bin/codex-tier.py
 ```
 
 ## Repository map
 
-- [`agents/`](agents/): five Codex agent profiles
+- [`agents/`](agents/): six Codex agent profiles
 - [`bin/codex-tier`](bin/codex-tier): hardened POSIX launcher
+- [`bin/codex-tier.ps1`](bin/codex-tier.ps1): hardened native Windows launcher
 - [`bin/codex-tier.py`](bin/codex-tier.py): local dispatcher runtime
 - [`skills/model-routing/SKILL.md`](skills/model-routing/SKILL.md): routing policy
 - [`schemas/local-dispatch-receipt.schema.json`](schemas/local-dispatch-receipt.schema.json): receipt contract
 - [`schemas/local-dispatch-envelope.schema.json`](schemas/local-dispatch-envelope.schema.json): emitted envelope contract
+- [`schemas/local-dispatch-receipt-v3.schema.json`](schemas/local-dispatch-receipt-v3.schema.json): experimental surgeon receipt contract
+- [`schemas/local-dispatch-envelope-v3.schema.json`](schemas/local-dispatch-envelope-v3.schema.json): experimental surgeon envelope contract
 - [`docs/local-dispatcher.md`](docs/local-dispatcher.md): detailed behavior and limits
 - [`docs/compatibility.md`](docs/compatibility.md): tested compatibility boundary
 - [`docs/threat-model.md`](docs/threat-model.md): security goals, trust anchors, and exclusions
 - [`policy.sample.toml`](policy.sample.toml): optional single-file model/effort customization
 - [`VERSION`](VERSION): canonical project version
 - [`install.sh`](install.sh): transactional installer
+- [`install.ps1`](install.ps1): native transactional Windows installer
 - [`docs/releasing.md`](docs/releasing.md): clean-CI, tagging, and prerelease procedure
 - [`scripts/validate.py`](scripts/validate.py): repository validator
 - [`tests/`](tests/): dispatcher and installer regression suite

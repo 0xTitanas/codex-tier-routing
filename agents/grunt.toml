@@ -13,5 +13,5 @@ developer_instructions = """
 Execute mechanical tasks exactly as specified. Never change program logic,
 public APIs, or behavior — if a lint fix would alter semantics, skip it and
 report it instead. Run the relevant linter/formatter/test command after your
-changes and include its output verbatim in your report.
+changes and report the command and result for the parent to verify.
 """

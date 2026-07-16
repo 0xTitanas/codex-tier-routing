@@ -2,10 +2,10 @@ name: CI
 
 on:
   pull_request:
-  workflow_dispatch:
   push:
-    tags:
-      - "v*"
+    branches: [main]
+    tags: ['v*']
+  workflow_dispatch:
 
 permissions:
   contents: read
@@ -17,7 +17,7 @@ concurrency:
 jobs:
   lint:
     name: Lint and format
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 10
     steps:
       - name: Checkout
@@ -45,8 +45,13 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, macos-latest]
-        python: ["3.11", "3.13", "3.14"]
+        os: [ubuntu-22.04, ubuntu-24.04, macos-latest, windows-latest]
+        python: ['3.11', '3.12', '3.13', '3.14']
+        system_python: [false]
+        include:
+          - os: ubuntu-26.04
+            python: '3.14'
+            system_python: true
     env:
       PYTHONDONTWRITEBYTECODE: '1'
     steps:
@@ -55,39 +60,453 @@ jobs:
         with:
           persist-credentials: false
       - name: Set up Python
+        if: ${{ !matrix.system_python }}
         uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
         with:
           python-version: ${{ matrix.python }}
-      - name: Harden macOS Python framework permissions
+      - name: Verify system Python
+        if: ${{ matrix.system_python }}
+        run: test "$(python3 -c 'import sys; print(f"{sys.version_info.major}.{sys.version_info.minor}")')" = "${{ matrix.python }}"
+      - name: Harden Linux Python path
+        if: ${{ runner.os == 'Linux' && !matrix.system_python }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          case "$pythonLocation" in
+            /opt/hostedtoolcache/Python/*/*) ;;
+            *) echo 'setup-python location is outside the hosted tool cache' >&2; exit 1 ;;
+          esac
+          PYTHON_PREFIX="$(/usr/bin/realpath "$pythonLocation")"
+          case "$PYTHON_PREFIX" in
+            /opt/hostedtoolcache/Python/*/*) ;;
+            *) echo 'resolved setup-python location escaped the hosted tool cache' >&2; exit 1 ;;
+          esac
+          PYTHON_INTERPRETER="$(/usr/bin/realpath "$PYTHON_PREFIX/bin/python")"
+          case "$PYTHON_INTERPRETER" in
+            "$PYTHON_PREFIX"/bin/python*) ;;
+            *) echo 'resolved Python interpreter escaped its installation' >&2; exit 1 ;;
+          esac
+          PYTHON_COMPONENT="$PYTHON_PREFIX"
+          while :; do
+            sudo chmod go-w "$PYTHON_COMPONENT"
+            test "$PYTHON_COMPONENT" = / && break
+            PYTHON_COMPONENT="${PYTHON_COMPONENT%/*}"
+            test -n "$PYTHON_COMPONENT" || PYTHON_COMPONENT=/
+          done
+          sudo chmod -R go-w "$PYTHON_PREFIX"
+          /usr/bin/env -u LD_PRELOAD -u LD_LIBRARY_PATH -u LD_AUDIT \
+            "$PYTHON_INTERPRETER" -I - "$PYTHON_PREFIX" "$PYTHON_INTERPRETER" <<'PY'
+          import os
+          from pathlib import Path
+          import stat
+          import sys
+
+          prefix = Path(sys.argv[1]).resolve(strict=True)
+          interpreter = Path(sys.argv[2]).resolve(strict=True)
+          trusted_owners = {0, os.geteuid()}
+
+          if Path(sys.base_prefix).resolve(strict=True) != prefix:
+              raise SystemExit("Python base prefix changed during hardening")
+          if Path(sys.executable).resolve(strict=True) != interpreter:
+              raise SystemExit("Python interpreter changed during hardening")
+
+          def check_component(current: Path) -> None:
+              details = current.lstat()
+              if details.st_uid not in trusted_owners:
+                  raise SystemExit(f"foreign-owned Python component: {current}")
+              if not stat.S_ISLNK(details.st_mode) and details.st_mode & (stat.S_IWGRP | stat.S_IWOTH):
+                  raise SystemExit(f"writable Python component: {current}")
+
+          def check_chain(path: Path) -> None:
+              current = Path(path.anchor)
+              check_component(current)
+              for part in path.parts[1:]:
+                  current /= part
+                  check_component(current)
+
+          check_chain(prefix)
+          check_chain(interpreter)
+          for root, directories, files in os.walk(prefix, followlinks=False):
+              for name in (*directories, *files):
+                  current = Path(root, name)
+                  check_component(current)
+                  if current.is_symlink():
+                      check_chain(current.resolve(strict=True))
+          PY
+          CODEX_TIER_PYTHON_BIN="$PYTHON_INTERPRETER" ./bin/codex-tier --version
+          echo "CODEX_TIER_PYTHON_BIN=$PYTHON_INTERPRETER" >> "$GITHUB_ENV"
+      - name: Harden Windows hosted paths
+        if: runner.os == 'Windows'
+        shell: powershell
+        run: |
+          # CI-only normalization for the GitHub-hosted Windows image.  Do not use this
+          # outside that disposable environment: it replaces ACLs on the supplied paths.
+          $ErrorActionPreference = 'Stop'
+          Set-StrictMode -Version Latest
+
+          $currentSid = [Security.Principal.WindowsIdentity]::GetCurrent().User.Value
+          $systemSid = 'S-1-5-18'
+          $administratorsSid = 'S-1-5-32-544'
+          $takeown = Join-Path $env:SystemRoot 'System32\takeown.exe'
+
+          function Fail([string]$Message) { throw "Windows CI hardening: $Message" }
+
+          function Get-LocalPath([string]$Path, [string]$Label) {
+              if ([string]::IsNullOrWhiteSpace($Path) -or $Path.StartsWith('\\') -or
+                  $Path.StartsWith('\\?\') -or $Path.StartsWith('\\.\') -or
+                  $Path -notmatch '^[A-Za-z]:[\\/]') {
+                  Fail "$Label must be an absolute local-drive path"
+              }
+              $normalized = $Path.Replace('/', '\')
+              if ($normalized.Substring(2).Contains(':')) { Fail "$Label contains an alternate data stream" }
+              foreach ($part in $normalized.Substring(3).Split([char]'\', [StringSplitOptions]::RemoveEmptyEntries)) {
+                  if ($part -in @('.', '..') -or $part.EndsWith('.') -or $part.EndsWith(' ')) {
+                      Fail "$Label contains an unsafe path component"
+                  }
+              }
+              return [IO.Path]::GetFullPath($normalized)
+          }
+
+          function Get-ExistingChain([string]$Path, [string]$Label) {
+              $path = Get-LocalPath $Path $Label
+              $root = [IO.Path]::GetPathRoot($path)
+              if ($path.TrimEnd('\') -eq $root.TrimEnd('\')) { Fail "$Label must not be a volume root" }
+              $chain = New-Object Collections.Generic.List[string]
+              $current = $root
+              foreach ($part in $path.Substring($root.Length).Split([char]'\', [StringSplitOptions]::RemoveEmptyEntries)) {
+                  $current = Join-Path $current $part
+                  if (-not (Test-Path -LiteralPath $current)) { Fail "$Label is missing: $current" }
+                  $item = Get-Item -LiteralPath $current -Force
+                  if (($item.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) { Fail "$Label contains a reparse point: $current" }
+                  if (-not $item.PSIsContainer -and $current -ne $path) { Fail "$Label has a non-directory ancestor: $current" }
+                  [void]$chain.Add($item.FullName)
+              }
+              return $chain.ToArray()
+          }
+
+          function Set-TrustedOwner([string]$Path, [bool]$Directory) {
+              $item = Get-Item -LiteralPath $Path -Force
+              if (($item.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0 -or $item.PSIsContainer -ne $Directory) { Fail "path changed before hardening: $Path" }
+              $owner = (Get-Acl -LiteralPath $Path).GetOwner([Security.Principal.SecurityIdentifier]).Value
+              if ($owner -notin @($currentSid, $systemSid, $administratorsSid)) {
+                  & $takeown /F $Path /A | Out-Null
+                  if ($LASTEXITCODE -ne 0) { Fail "takeown failed: $Path" }
+              }
+          }
+
+          function Set-ProtectedAcl([string]$Path, [bool]$Directory, [bool]$Inheritable) {
+              Set-TrustedOwner $Path $Directory
+              $security = if ($Directory) { New-Object Security.AccessControl.DirectorySecurity } else { New-Object Security.AccessControl.FileSecurity }
+              $security.SetAccessRuleProtection($true, $false)
+              $inheritance = if ($Directory -and $Inheritable) {
+                  [Security.AccessControl.InheritanceFlags]::ContainerInherit -bor [Security.AccessControl.InheritanceFlags]::ObjectInherit
+              } else { [Security.AccessControl.InheritanceFlags]::None }
+              foreach ($sidValue in @($currentSid, $systemSid, $administratorsSid)) {
+                  $rule = New-Object Security.AccessControl.FileSystemAccessRule(
+                      (New-Object Security.Principal.SecurityIdentifier($sidValue)),
+                      [Security.AccessControl.FileSystemRights]::FullControl,
+                      $inheritance,
+                      [Security.AccessControl.PropagationFlags]::None,
+                      [Security.AccessControl.AccessControlType]::Allow
+                  )
+                  [void]$security.AddAccessRule($rule)
+              }
+              if ($Directory) { [IO.Directory]::SetAccessControl($Path, $security) } else { [IO.File]::SetAccessControl($Path, $security) }
+          }
+
+          function Protect-DirectChildren([string]$Path) {
+              foreach ($child in Get-ChildItem -LiteralPath $Path -Force) {
+                  if (($child.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) { Fail "ancestor has a reparse-point child: $($child.FullName)" }
+                  $security = Get-Acl -LiteralPath $child.FullName
+                  $security.SetAccessRuleProtection($true, $true)
+                  Set-Acl -LiteralPath $child.FullName -AclObject $security
+              }
+          }
+
+          function Get-Tree([string]$Root, [string]$Label, [bool]$AllowPython3Link) {
+              $objects = New-Object Collections.Generic.List[object]
+              $stack = New-Object Collections.Generic.Stack[string]
+              $stack.Push($Root)
+              while ($stack.Count -gt 0) {
+                  $path = $stack.Pop()
+                  $item = Get-Item -LiteralPath $path -Force
+                  if (($item.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) {
+                      $expected = Join-Path $Root 'python3.exe'
+                      if (-not $AllowPython3Link -or -not [string]::Equals($item.FullName, $expected, [StringComparison]::OrdinalIgnoreCase)) { Fail "$Label contains a reparse point: $path" }
+                      $targetName = [string]$item.Target
+                      $target = if ([IO.Path]::IsPathRooted($targetName)) { Get-LocalPath $targetName 'python3.exe target' } else { Get-LocalPath (Join-Path $Root $targetName) 'python3.exe target' }
+                      if (-not [string]::Equals($target, (Join-Path $Root 'python.exe'), [StringComparison]::OrdinalIgnoreCase)) { Fail 'python3.exe link does not resolve exactly to the in-prefix python.exe' }
+                  }
+                  [void]$objects.Add($item)
+                  if ($item.PSIsContainer) {
+                      foreach ($child in Get-ChildItem -LiteralPath $path -Force) { $stack.Push($child.FullName) }
+                  }
+              }
+              return $objects.ToArray()
+          }
+
+          function Materialize-Python3Link([string]$PythonRoot) {
+              $link = Join-Path $PythonRoot 'python3.exe'
+              if (-not (Test-Path -LiteralPath $link)) { return }
+              $item = Get-Item -LiteralPath $link -Force
+              if (($item.Attributes -band [IO.FileAttributes]::ReparsePoint) -eq 0) { return }
+              $targetName = [string]$item.Target
+              if ([string]::IsNullOrWhiteSpace($targetName)) { Fail 'python3.exe link has no target' }
+              $target = if ([IO.Path]::IsPathRooted($targetName)) { Get-LocalPath $targetName 'python3.exe target' } else { Get-LocalPath (Join-Path $PythonRoot $targetName) 'python3.exe target' }
+              $python = Join-Path $PythonRoot 'python.exe'
+              if (-not [string]::Equals($target, $python, [StringComparison]::OrdinalIgnoreCase) -or -not (Test-Path -LiteralPath $python)) {
+                  Fail 'python3.exe link does not resolve exactly to the in-prefix python.exe'
+              }
+              $temporary = Join-Path $PythonRoot 'codex-tier-python3-materialized.exe'
+              [IO.File]::Copy($python, $temporary, $false)
+              Remove-Item -LiteralPath $link -Force
+              Move-Item -LiteralPath $temporary -Destination $link
+          }
+
+          $sourceWorkspace = Get-LocalPath $env:GITHUB_WORKSPACE 'GITHUB_WORKSPACE'
+          $pythonRoot = Get-LocalPath $env:pythonLocation 'pythonLocation'
+          $toolCache = Get-LocalPath $env:RUNNER_TOOL_CACHE 'RUNNER_TOOL_CACHE'
+          $runnerTemp = Get-LocalPath $env:RUNNER_TEMP 'RUNNER_TEMP'
+          $runnerRoot = [IO.Directory]::GetParent($runnerTemp).FullName
+          $runnerPrefix = $runnerRoot.TrimEnd('\') + '\'
+          if (-not $sourceWorkspace.StartsWith($runnerPrefix, [StringComparison]::OrdinalIgnoreCase)) { Fail 'GITHUB_WORKSPACE is outside the hosted runner root' }
+          $repositoryParts = $env:GITHUB_REPOSITORY.Split([char]'/', [StringSplitOptions]::RemoveEmptyEntries)
+          $workspaceParts = $sourceWorkspace.Substring($runnerPrefix.Length).Split([char]'\', [StringSplitOptions]::RemoveEmptyEntries)
+          if ($repositoryParts.Count -ne 2 -or $workspaceParts.Count -ne 2 -or
+              -not [string]::Equals($workspaceParts[0], $repositoryParts[1], [StringComparison]::OrdinalIgnoreCase) -or
+              -not [string]::Equals($workspaceParts[1], $repositoryParts[1], [StringComparison]::OrdinalIgnoreCase)) { Fail 'GITHUB_WORKSPACE is not an exact hosted checkout path' }
+          if (-not $pythonRoot.StartsWith(($toolCache.TrimEnd('\') + '\'), [StringComparison]::OrdinalIgnoreCase)) { Fail 'pythonLocation is outside RUNNER_TOOL_CACHE' }
+          $pythonParts = $pythonRoot.Substring($toolCache.TrimEnd('\').Length).TrimStart('\').Split([char]'\')
+          if ($pythonParts.Count -ne 3 -or $pythonParts[0] -ne 'Python' -or $pythonParts[1] -notmatch '^\d+\.\d+\.\d+$' -or $pythonParts[2] -notmatch '^(x64|x86|arm64)$') { Fail 'pythonLocation is not an exact hosted Python prefix' }
+          $python = Join-Path $pythonRoot 'python.exe'
+          if (-not (Test-Path -LiteralPath $python)) { Fail 'python.exe is missing from pythonLocation' }
+
+          $pythonChain = @(Get-ExistingChain $pythonRoot 'pythonLocation')
+          $sourceTree = Get-Tree $sourceWorkspace 'GITHUB_WORKSPACE' $false
+          [void](Get-Tree $pythonRoot 'pythonLocation' $true)
+          Materialize-Python3Link $pythonRoot
+          $pythonTree = Get-Tree $pythonRoot 'pythonLocation' $false
+
+          if ($pythonChain.Count -gt 1) {
+            foreach ($path in $pythonChain[0..($pythonChain.Count - 2)]) {
+              $item = Get-Item -LiteralPath $path -Force
+              if (-not $item.PSIsContainer) { Fail "ancestor is not a directory: $path" }
+              # Preserve each sibling's effective ACL before replacing the parent DACL.
+              Protect-DirectChildren $item.FullName
+              Set-ProtectedAcl $item.FullName $true $false
+            }
+          }
+          foreach ($item in $pythonTree) { Set-ProtectedAcl $item.FullName $item.PSIsContainer $item.PSIsContainer }
+
+          $ciRoot = Join-Path $pythonRoot '.codex-tier-ci'
+          if (Test-Path -LiteralPath $ciRoot) { Fail 'CI staging root already exists' }
+          [IO.Directory]::CreateDirectory($ciRoot) | Out-Null
+          Set-ProtectedAcl $ciRoot $true $true
+          $workspace = Join-Path $ciRoot 'source'
+          [IO.Directory]::CreateDirectory($workspace) | Out-Null
+          foreach ($sourceItem in $sourceTree) {
+              $relative = $sourceItem.FullName.Substring($sourceWorkspace.Length).TrimStart([char]'\')
+              if (-not $relative) { continue }
+              $current = Get-Item -LiteralPath $sourceItem.FullName -Force
+              if (($current.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0 -or
+                  $current.PSIsContainer -ne $sourceItem.PSIsContainer) { Fail "GITHUB_WORKSPACE changed during staging: $($sourceItem.FullName)" }
+              $destination = Join-Path $workspace $relative
+              if ($current.PSIsContainer) {
+                  [IO.Directory]::CreateDirectory($destination) | Out-Null
+              } else {
+                  [IO.Directory]::CreateDirectory([IO.Path]::GetDirectoryName($destination)) | Out-Null
+                  [IO.File]::Copy($current.FullName, $destination, $false)
+              }
+          }
+          $workspaceTree = Get-Tree $workspace 'staged GITHUB_WORKSPACE' $false
+          foreach ($item in $workspaceTree) { Set-ProtectedAcl $item.FullName $item.PSIsContainer $item.PSIsContainer }
+
+          if ($env:GITHUB_SHA -notmatch '^[0-9a-fA-F]{40}([0-9a-fA-F]{24})?$') { Fail 'GITHUB_SHA is invalid' }
+          Set-Location -LiteralPath $workspace
+          $stagedHead = ([string](& git rev-parse --verify HEAD)).Trim()
+          if ($LASTEXITCODE -ne 0 -or -not [string]::Equals($stagedHead, $env:GITHUB_SHA, [StringComparison]::OrdinalIgnoreCase)) { Fail 'staged checkout HEAD does not match GITHUB_SHA' }
+          & git fsck --strict
+          if ($LASTEXITCODE -ne 0) { Fail 'staged checkout failed git fsck' }
+          & git diff --no-ext-diff --no-textconv --exit-code $env:GITHUB_SHA --
+          if ($LASTEXITCODE -ne 0) { Fail 'staged checkout differs from GITHUB_SHA' }
+          $untracked = @(& git ls-files --others --exclude-standard)
+          if ($LASTEXITCODE -ne 0 -or $untracked.Count -ne 0) { Fail 'staged checkout contains untracked files' }
+
+          $privateRoot = Join-Path $ciRoot 'home'
+          [IO.Directory]::CreateDirectory($privateRoot) | Out-Null
+          Set-ProtectedAcl $privateRoot $true $true
+          $privateTemp = Join-Path $privateRoot 'tmp'
+          [IO.Directory]::CreateDirectory($privateTemp) | Out-Null
+          Set-ProtectedAcl $privateTemp $true $true
+
+          & $python -I -c 'import os, sys; assert os.path.normcase(sys.executable) == os.path.normcase(sys.argv[1]); assert os.path.normcase(sys.base_prefix) == os.path.normcase(sys.argv[2])' $python $pythonRoot
+          if ($LASTEXITCODE -ne 0) { Fail 'isolated Python smoke check failed' }
+          $env:CODEX_TIER_PYTHON_BIN = $python
+          & (Join-Path $workspace 'bin\codex-tier.ps1') --version
+          if ($LASTEXITCODE -ne 0) { Fail 'launcher smoke check failed' }
+          & (Join-Path $workspace 'install.ps1') -CodexHome (Join-Path $privateRoot 'dry-run') -DryRun
+          if ($LASTEXITCODE -ne 0) { Fail 'installer dry-run smoke check failed' }
+          $postCheck = @'
+          import importlib.util
+          import os
+          import sys
+          from pathlib import Path
+
+          workspace, prefix, executable = map(Path, sys.argv[1:])
+          spec = importlib.util.spec_from_file_location("codex_tier", workspace / "bin" / "codex-tier.py")
+          module = importlib.util.module_from_spec(spec)
+          sys.modules[spec.name] = module
+          spec.loader.exec_module(module)
+          module._windows_validate_path(prefix, label="CI Python prefix", require_directory=True)
+          module._windows_validate_path(executable, label="CI Python executable", require_file=True)
+          for root, directories, files in os.walk(prefix, followlinks=False):
+              for name in (*directories, *files):
+                  candidate = Path(root, name)
+                  if module._windows_attributes(candidate, label="CI Python prefix object") & module._WINDOWS_REPARSE_POINT:
+                      raise SystemExit(f"CI Python prefix contains a reparse point: {candidate}")
+                  module._windows_acl(candidate, label=f"CI Python prefix object {candidate}", final=True)
+          '@
+          $postCheck | & $python -I - $workspace $pythonRoot $python
+          if ($LASTEXITCODE -ne 0) { Fail 'post-hardening Python-prefix verification failed' }
+
+          "CODEX_TIER_PYTHON_BIN=$python" | Add-Content -LiteralPath $env:GITHUB_ENV
+          "CODEX_TIER_CI_SOURCE_ROOT=$workspace" | Add-Content -LiteralPath $env:GITHUB_ENV
+          "CODEX_TIER_CI_PRIVATE_ROOT=$privateRoot" | Add-Content -LiteralPath $env:GITHUB_ENV
+          "CODEX_TIER_CI_PRIVATE_TEMP=$privateTemp" | Add-Content -LiteralPath $env:GITHUB_ENV
+      - name: Harden macOS tool paths
         if: runner.os == 'macOS'
         shell: bash
         run: |
           FRAMEWORK_VERSIONS="$(python3 -c 'from pathlib import Path; import sys; print(Path(sys.base_prefix).resolve().parent)')"
+          FRAMEWORK_INTERPRETER="$(python3 -c 'from pathlib import Path; import sys; print(Path(sys.executable).resolve())')"
           test "$(basename "$FRAMEWORK_VERSIONS")" = "Versions"
-          sudo chmod g-w "$FRAMEWORK_VERSIONS"
-      - name: Validate repository
+          case "$FRAMEWORK_INTERPRETER" in
+            "$FRAMEWORK_VERSIONS"/*) ;;
+            *) echo 'resolved Python interpreter is outside the validated framework path' >&2; exit 1 ;;
+          esac
+          FRAMEWORK_COMPONENT="$FRAMEWORK_INTERPRETER"
+          while :; do
+            test "$(stat -f '%u' "$FRAMEWORK_COMPONENT")" = 0
+            sudo chmod go-w "$FRAMEWORK_COMPONENT"
+            test "$FRAMEWORK_COMPONENT" = "$FRAMEWORK_VERSIONS" && break
+            FRAMEWORK_COMPONENT="${FRAMEWORK_COMPONENT%/*}"
+          done
+          python3 - "$FRAMEWORK_VERSIONS" "$FRAMEWORK_INTERPRETER" <<'PY'
+          import os
+          import stat
+          import sys
+
+          root, executable = (os.path.realpath(value) for value in sys.argv[1:])
+          relative = os.path.relpath(executable, root)
+          if relative == os.pardir or relative.startswith(os.pardir + os.sep):
+              raise SystemExit("resolved Python interpreter is outside the validated framework path")
+          current = root
+          for component in ("", *relative.split(os.sep)):
+              if component:
+                  current = os.path.join(current, component)
+              details = os.stat(current)
+              if details.st_uid != 0:
+                  raise SystemExit(f"non-root framework component: {current}")
+              if details.st_mode & (stat.S_IWGRP | stat.S_IWOTH):
+                  raise SystemExit(f"writable framework component: {current}")
+          PY
+          echo "CODEX_TIER_PYTHON_BIN=$FRAMEWORK_INTERPRETER" >> "$GITHUB_ENV"
+          SAFE_GIT_BIN="$RUNNER_TEMP/codex-tier-safe-bin"
+          mkdir -m 700 "$SAFE_GIT_BIN"
+          ln -s /usr/bin/git "$SAFE_GIT_BIN/git"
+          "$SAFE_GIT_BIN/git" --version
+          echo "$SAFE_GIT_BIN" >> "$GITHUB_PATH"
+      - name: Validate repository (POSIX)
+        if: runner.os != 'Windows'
         run: python3 scripts/validate.py
-      - name: Run unit tests
-        run: python3 -m unittest discover -s tests -v
-      - name: Check shell syntax
+      - name: Validate repository (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          Set-Location -LiteralPath $env:CODEX_TIER_CI_SOURCE_ROOT
+          & $env:CODEX_TIER_PYTHON_BIN scripts/validate.py
+      - name: Run unit tests (POSIX)
+        if: runner.os != 'Windows'
+        run: |
+          umask 0002
+          python3 -m unittest discover -s tests -v
+      - name: Run native Windows unit tests
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          Set-Location -LiteralPath $env:CODEX_TIER_CI_SOURCE_ROOT
+          $env:USERPROFILE = $env:CODEX_TIER_CI_PRIVATE_ROOT
+          $env:HOME = $env:CODEX_TIER_CI_PRIVATE_ROOT
+          $env:TEMP = $env:CODEX_TIER_CI_PRIVATE_TEMP
+          $env:TMP = $env:CODEX_TIER_CI_PRIVATE_TEMP
+          & $env:CODEX_TIER_PYTHON_BIN -m unittest discover -s tests -v
+      - name: Check POSIX shell syntax
+        if: runner.os != 'Windows'
         run: |
           sh -n install.sh
           sh -n bin/codex-tier
-      - name: Compile Python sources
+      - name: Compile Python sources (POSIX)
+        if: runner.os != 'Windows'
         run: |
           PYTHONPYCACHEPREFIX="$RUNNER_TEMP/codex-tier-pycache" python3 -m py_compile \
-            bin/codex-tier.py \
-            scripts/validate.py \
-            tests/test_codex_tier.py \
-            tests/test_installer.py \
-            tests/test_validate.py
-      - name: Exercise strict installer dry-run
+            bin/codex-tier.py scripts/validate.py tests/test_codex_tier.py \
+            tests/test_installer.py tests/test_validate.py tests/test_windows.py \
+            tests/test_windows_installer.py
+      - name: Compile Python sources (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          Set-Location -LiteralPath $env:CODEX_TIER_CI_SOURCE_ROOT
+          $env:PYTHONPYCACHEPREFIX = Join-Path $env:CODEX_TIER_CI_PRIVATE_TEMP 'pycache'
+          & $env:CODEX_TIER_PYTHON_BIN -m py_compile bin/codex-tier.py scripts/validate.py tests/test_codex_tier.py tests/test_installer.py tests/test_validate.py tests/test_windows.py tests/test_windows_installer.py
+      - name: Exercise POSIX strict installer dry-run
+        if: runner.os != 'Windows'
         run: |
           TEST_CODEX_HOME="$(python3 -c 'import os,tempfile; print(os.path.realpath(tempfile.mkdtemp()))')"
           trap 'rm -rf "$TEST_CODEX_HOME"' EXIT
           CODEX_TIER_PYTHON_BIN="$(python3 -c 'import os,sys; print(os.path.realpath(sys.executable))')" \
             ./install.sh --strict --dry-run --codex-home "$TEST_CODEX_HOME"
-      - name: Verify source tree unchanged
+      - name: Exercise native Windows fresh install
+        if: runner.os == 'Windows'
+        shell: powershell
         run: |
-          git diff --exit-code
-          test -z "$(git ls-files --others --exclude-standard)"
+          Set-Location -LiteralPath $env:CODEX_TIER_CI_SOURCE_ROOT
+          $env:USERPROFILE = $env:CODEX_TIER_CI_PRIVATE_ROOT
+          $env:HOME = $env:CODEX_TIER_CI_PRIVATE_ROOT
+          $env:TEMP = $env:CODEX_TIER_CI_PRIVATE_TEMP
+          $env:TMP = $env:CODEX_TIER_CI_PRIVATE_TEMP
+          $testHome = Join-Path $env:CODEX_TIER_CI_PRIVATE_ROOT 'codex-tier-fresh-install'
+          & .\install.ps1 -CodexHome $testHome
+          if ($LASTEXITCODE -ne 0) { throw 'Windows installer failed' }
+          $env:CODEX_HOME = $testHome
+          & "$testHome\bin\codex-tier.ps1" --version
+          if ($LASTEXITCODE -ne 0) { throw 'Installed Windows command failed' }
+      - name: Verify source tree unchanged (POSIX)
+        if: runner.os != 'Windows'
+        run: |
+          /usr/bin/git diff --exit-code HEAD
+          test -z "$(/usr/bin/git ls-files --others --exclude-standard)"
+      - name: Verify source tree unchanged (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          Set-Location -LiteralPath $env:CODEX_TIER_CI_SOURCE_ROOT
+          $head = ([string](& git rev-parse --verify HEAD)).Trim()
+          if ($LASTEXITCODE -ne 0 -or -not [string]::Equals($head, $env:GITHUB_SHA, [StringComparison]::OrdinalIgnoreCase)) { throw 'staged source HEAD changed' }
+          git diff --no-ext-diff --no-textconv --exit-code $env:GITHUB_SHA --
+          if ($LASTEXITCODE -ne 0) { throw 'tracked files changed in the staged source tree' }
+          $untracked = @(git ls-files --others --exclude-standard)
+          if ($LASTEXITCODE -ne 0) { throw 'unable to inspect the staged source tree' }
+          if ($untracked.Count -ne 0) {
+            throw 'untracked files were created in the staged source tree'
+          }
+          Set-Location -LiteralPath $env:GITHUB_WORKSPACE
+          $head = ([string](& git rev-parse --verify HEAD)).Trim()
+          if ($LASTEXITCODE -ne 0 -or -not [string]::Equals($head, $env:GITHUB_SHA, [StringComparison]::OrdinalIgnoreCase)) { throw 'checkout source HEAD changed' }
+          git diff --no-ext-diff --no-textconv --exit-code $env:GITHUB_SHA --
+          if ($LASTEXITCODE -ne 0) { throw 'tracked files changed in the checkout source tree' }
+          $untracked = @(git ls-files --others --exclude-standard)
+          if ($LASTEXITCODE -ne 0) { throw 'unable to inspect the checkout source tree' }
+          if ($untracked.Count -ne 0) {
+            throw 'untracked files were created in the checkout source tree'
+          }

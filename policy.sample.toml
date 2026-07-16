@@ -5,7 +5,7 @@ schema = "codex-tier-routing/policy/v1"
 # then one bounded canary for every route whose model or effort changed.
 
 [routes.scout]
-model = "gpt-5.6-luna"
+model = "gpt-5.6-terra"
 effort = "low"
 
 [routes.grunt]
@@ -17,7 +17,7 @@ model = "gpt-5.6-terra"
 effort = "medium"
 
 [routes.reviewer]
-model = "gpt-5.6-terra"
+model = "gpt-5.6-sol"
 effort = "high"
 
 [routes.architect]

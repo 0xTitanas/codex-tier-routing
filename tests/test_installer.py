@@ -20,8 +20,10 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 
 
+@unittest.skipIf(os.name == "nt", "POSIX installer regression")
 class InstallerTests(unittest.TestCase):
     def setUp(self) -> None:
+        self.addCleanup(os.umask, os.umask(0o077))
         self.temp = tempfile.TemporaryDirectory()
         # macOS commonly presents /var as a symlink to /private/var.  The
         # installer deliberately rejects lexical symlink components, so tests
@@ -308,6 +310,8 @@ class InstallerTests(unittest.TestCase):
         self.assertIn(f"'CODEX_HOME={self.home}'", result.stdout)
         uninstall = result.stdout.strip().splitlines()[-1]
         self.assertIn(" -i ", uninstall)
+        addition = b'\n[projects."/synthetic/project"]\ntrust_level = "trusted"\n'
+        config.write_bytes(config.read_bytes() + addition)
         startup = self.base / "uninstall-startup"
         startup.mkdir()
         marker = self.base / "uninstall-sitecustomize-ran"
@@ -328,15 +332,26 @@ class InstallerTests(unittest.TestCase):
         )
         self.assertEqual(removed.returncode, 0, removed.stdout + removed.stderr)
         self.assertFalse(marker.exists())
-        self.assertFalse(config.exists())
+        self.assertEqual(config.read_bytes(), addition)
         self.assertFalse((self.home / "bin" / "codex-tier").exists())
         self.assertFalse((self.home / "bin" / "codex-tier.py").exists())
+        self.assertEqual(list((self.home / "agents").glob("*.toml")), [])
 
     def test_installs_complete_bundle_and_probe_runs(self) -> None:
         result = self.install()
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertTrue((self.home / "skills" / "model-routing" / "SKILL.md").is_file())
-        self.assertEqual(len(list((self.home / "agents").glob("*.toml"))), 5)
+        self.assertEqual(
+            {path.name for path in (self.home / "agents").glob("*.toml")},
+            {
+                "scout.toml",
+                "grunt.toml",
+                "builder.toml",
+                "reviewer.toml",
+                "architect.toml",
+                "surgeon.toml",
+            },
+        )
         dispatcher = self.home / "bin" / "codex-tier"
         runtime = self.home / "bin" / "codex-tier.py"
         self.assertTrue(dispatcher.is_file())
@@ -622,6 +637,7 @@ class InstallerTests(unittest.TestCase):
                 "builder.toml",
                 "reviewer.toml",
                 "architect.toml",
+                "surgeon.toml",
             ):
                 path = self.home / "agents" / name
                 path.parent.mkdir(parents=True, exist_ok=True)
@@ -639,15 +655,15 @@ class InstallerTests(unittest.TestCase):
             return old
 
         for point in [
-            *[str(number) for number in range(1, 8)],
+            *[str(number) for number in range(1, 10)],
             "signal-1",
             "pre-move-1",
             "move-failure-1",
             "signal-pre-move-1",
             "post-move-1",
             "signal-post-move-1",
-            "pre-move-6",
-            "signal-post-move-6",
+            "pre-move-7",
+            "signal-post-move-7",
             "prepromotion-race",
             "backup-promotion",
         ]:
@@ -963,6 +979,7 @@ class InstallerTests(unittest.TestCase):
                     "builder.toml",
                     "reviewer.toml",
                     "architect.toml",
+                    "surgeon.toml",
                 ):
                     path = self.home / "agents" / name
                     path.parent.mkdir(parents=True, exist_ok=True)

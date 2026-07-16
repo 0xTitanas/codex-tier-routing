@@ -97,22 +97,30 @@ response was lost.
 
 ## Route table
 
-The local dispatcher accepts these stable routes and shipped defaults:
+The local dispatcher accepts five stable routes plus the fixed experimental
+`surgeon` route:
 
 | Work | Route | Model | Effort | Sandbox |
 |---|---|---|---|---|
-| Search and dependency inventory | `scout` | `gpt-5.6-luna` | low | read-only |
+| Search and dependency inventory | `scout` | `gpt-5.6-terra` | low | read-only |
 | Formatting and mechanical edits | `grunt` | `gpt-5.6-luna` | low | workspace-write |
 | Scoped implementation and tests | `builder` | `gpt-5.6-terra` | medium | workspace-write |
-| Correctness and coverage review | `reviewer` | `gpt-5.6-terra` | high | read-only |
+| Correctness and coverage review | `reviewer` | `gpt-5.6-sol` | high | read-only |
 | Difficult design decisions | `architect` | `gpt-5.6-sol` | xhigh | read-only |
+| Bounded cross-cutting changes | `surgeon` | `gpt-5.6-sol` | high | workspace-write |
 
 These values are requests until the host-written rollout confirms them. An
-owner-only `tier-routing/policy.toml` may change only model and effort. The
-command accepts no per-dispatch override, and sandbox, network, approval, role,
-and concurrency boundaries remain fixed. A custom policy applies to the local
-dispatcher; packaged agent profiles remain default descriptions and cannot
-independently attest custom values.
+owner-only `tier-routing/policy.toml` may change model and effort for the five
+stable routes. The experimental `surgeon` tuple and all sandbox, network,
+approval, role, and concurrency boundaries remain fixed. A custom policy
+applies to the local dispatcher; packaged agent profiles remain default
+descriptions and cannot independently attest custom values.
+
+Routes are operational names for recurring work with a distinct
+model/effort/sandbox tuple. The receipt binds that route-defining tuple plus the
+approval policy, workdir, session, launcher/runtime chain, effective policy,
+output hash, and rollout hash. A distinct tuple is necessary but not sufficient
+reason to add a route.
 
 ## Task classification
 
@@ -133,33 +141,48 @@ the parent session.
 - Treat child output as a claim, not a result.
 - Verify changed files and tests directly before accepting write-capable work.
 - Use a clean worktree or disposable branch for write-capable routes.
+- Use `surgeon` only in a clean linked Git worktree with explicit completion
+  criteria, and require parent review before integration.
+- `surgeon` preflight rejects submodules and any Git `filter` attributes; do
+  not bypass that gate or run repository-configured filter helpers manually.
 - Reconcile effects before retrying any ambiguous failure.
 - Keep dependent writes sequential.
-- Cap concurrent dispatches at four.
+- The dispatcher prevents concurrent write routes from sharing one workdir;
+  parent sequencing is still required for dependent work and read consistency.
+- Cap concurrent dispatches at four per Codex home.
 - Run one bounded read-only canary before a larger batch.
 - Never describe local host observation as provider-side model attestation.
 
 ## Retry policy
 
-After an operator has inspected the failure and reconciled any effects,
-read-only work—or writes protected by a stable idempotency key and independent
-effect checks—may follow this manual escalation policy:
+The dispatcher never retries. After an operator has inspected the failure and
+reconciled any effects, read-only work—or writes protected by a stable
+idempotency key and independent effect checks—may follow this manual policy:
 
 1. Retry once with a narrower task.
-2. If the second attempt fails, reclassify the task and choose another route
-   only when its role fits; never infer model strength from a configured name.
+2. If the second attempt fails because the task needs more capability,
+   reclassify it and move one step on the applicable ladder only when the new
+   role fits: `scout` -> `reviewer` -> `architect`, or
+   `grunt` -> `builder` -> `surgeon`. Log the reason.
 3. Stop after the third failure and return the evidence to the operator.
 
-Credential changes, destructive actions, public writes, and uncertain effects
-stop without an automatic retry.
+Authentication, configuration, sandbox, transport, and environment failures do
+not justify a stronger route. Credential changes, destructive actions, public
+writes, timeouts, and uncertain effects stop without an automatic retry.
+
+`ultra` remains outside this release's tested and attested dispatcher boundary.
+Do not infer its single-agent or subagent behavior from another Codex surface.
 
 ## Receipt boundary
 
-A valid `codex-tier-routing/local-dispatch-receipt/v2` receipt binds the stable
-route to the observed model, effort, sandbox policy, approval policy, working
-directory, child session, launcher/runtime chain, output hash, rollout hash, and
-the complete effective policy plus canonical/input hashes. Its claim class is
-`dispatcher_configured_and_host_observed`.
+A valid `codex-tier-routing/local-dispatch-receipt/v2` receipt binds one of the
+five stable routes to the observed model, effort, sandbox policy, approval
+policy, working directory, child session, launcher/runtime chain, output hash,
+rollout hash, and the complete effective policy plus canonical/input hashes.
+The experimental `surgeon` route requires
+`codex-tier-routing/local-dispatch-receipt/v3`, which additionally binds its
+clean linked-worktree precondition and starting Git `HEAD`. Both claim classes
+remain `dispatcher_configured_and_host_observed`.
 
 That proves what the local Codex host recorded. It does not prove provider-side
 model identity, lineage, output quality, or correctness.

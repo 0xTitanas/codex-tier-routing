@@ -4,6 +4,32 @@
 
 No changes yet.
 
+## [1.1.0-rc.1] - 2026-07-15
+
+- Added the six-route table, including Terra/low `scout`, Sol/high `reviewer`, and
+  experimental Sol/high/workspace-write `surgeon` routing.
+- Enforced per-workdir writer exclusion across Codex homes used by the same
+  operating-system identity.
+- Preserved unrelated Codex configuration additions during strict disable and
+  uninstall while retaining fail-closed managed-setting conflict handling.
+- Restored repository privacy validation and made test fixtures independent of
+  the caller's umask.
+- Expanded release gates to Ubuntu 22.04, 24.04, and 26.04 LTS and every
+  supported Python minor from 3.11 through 3.14 where hosted runtimes exist.
+- Added native Windows installer and launcher support, including SID/DACL and
+  reparse-point checks, `LockFileEx` writer exclusion, Job Object containment,
+  atomic replacement, rollback, collision backups, and user `PATH` setup.
+  Native deterministic and installation checks plus manual negative and
+  all-six-route live checks pass in an interactive Windows 11 session,
+  including an independently verified `surgeon` diff. Codex CLI 0.144.4
+  sandboxed tool processes still exit before command execution with status
+  `0xc0000142` under OpenSSH/Session 0, which is outside the supported Windows
+  boundary.
+- Clarified routing-policy language and repaired CI trigger and matrix coverage.
+
+This is a release candidate. No cost, speed, reliability, quality, OpenAI
+endorsement, or provider-side model-attestation claim is made.
+
 ## [1.0.0-rc.2] - 2026-07-14
 
 - Replaced repository-specific privacy literals with generic checks for
@@ -53,5 +79,6 @@ Withdrawn on 2026-07-14 during public-history cleanup.
 This is a release candidate. No cost, speed, reliability, quality, OpenAI
 endorsement, or provider-side model-attestation claim is made.
 
-[Unreleased]: https://github.com/0xTitanas/codex-tier-routing/compare/v1.0.0-rc.2...HEAD
+[Unreleased]: https://github.com/0xTitanas/codex-tier-routing/compare/v1.1.0-rc.1...HEAD
+[1.1.0-rc.1]: https://github.com/0xTitanas/codex-tier-routing/compare/v1.0.0-rc.2...v1.1.0-rc.1
 [1.0.0-rc.2]: https://github.com/0xTitanas/codex-tier-routing/releases/tag/v1.0.0-rc.2
