@@ -2,7 +2,7 @@
 
 # Codex Tier Routing
 
-**Experimental receipt-bearing task routes, redesigning around native Codex agents.**
+**Experimental receipt-bearing task routes retained for existing users.**
 
 [![License: MIT](https://img.shields.io/badge/license-MIT-2ea44f.svg)](LICENSE)
 [![Release: v1.1.0-rc.1](https://img.shields.io/badge/release-v1.1.0--rc.1-f0ad4e.svg)](CHANGELOG.md)
@@ -11,14 +11,14 @@
 </div>
 
 > [!IMPORTANT]
-> **Status: redesign in progress.** Current Codex releases provide native
+> **Maintenance status.** Current Codex releases provide native
 > [custom agents and multi-agent orchestration](https://developers.openai.com/codex/subagents).
 > Native agents now cover task-role configuration and orchestration, so this
 > receipt-bearing router is not recommended for new installations. Existing
 > users should follow [Disable or uninstall](#disable-or-uninstall) before
-> removing any managed files. The project is being redesigned as a native agent
-> pack while declarative
-> [plugin agent bundling](https://github.com/openai/codex/issues/18988) remains an upstream gap.
+> removing any managed files. This repository remains available for existing
+> users, uninstall instructions, and technical reference. No replacement
+> release is currently planned.
 
 ![Codex Tier Routing: route by task, verify before trust](docs/assets/codex-tier-routing-header.jpg)
 
@@ -112,7 +112,8 @@ See [compatibility](docs/compatibility.md) for the tested boundary.
 
 ## Quick start
 
-> New installations are paused while the project moves to native Codex agents.
+> New installations are paused and not recommended. Use native Codex agents for
+> new task-role configuration.
 > The commands below are retained to reproduce the experimental candidate.
 
 Install the prerequisites above and sign in to Codex. On macOS or Linux, these
